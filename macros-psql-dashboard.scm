@@ -704,7 +704,9 @@
           (list "-c" (string-append
                       "{ " (psql--sh-quote (psql--command)) " "
                       (if (equal? u "") "" (string-append "-d " (psql--sh-quote u) " "))
-                      "-v FETCH_COUNT=100 -X -q -A -P pager=off -f " (psql--sh-quote file)
+                      "-v FETCH_COUNT=100 -X -q -A"
+                      " -P recordsep=" psql--RS " -P fieldsep=" psql--FS
+                      " -P pager=off -f " (psql--sh-quote file)
                       " 2>&1; echo $? > " (psql--sh-quote status)
                       "; } | head -c " (number->string (psql--max-output))
                       "; exit \"$(cat " (psql--sh-quote status) ")\""))
@@ -725,20 +727,27 @@
            (async-lane-cancel "psql")))))
 
 ;; ── results formatting ────────────────────────────────────────────────────────
-;; psql's unaligned rows are `|`-separated; build an ORG-MODE style table —
-;; `| cell | cell |` rows, a `|---+---|` rule under the header — with each
-;; cell clamped, so one fat value (an embedding, a blob) costs 80 chars
-;; instead of megabytes of padding. Consecutive `|` lines form a table block;
-;; anything else — `(N rows)` footers, `Time:` lines, errors — passes through,
-;; colored by kind. Everything is produced as (text face) pairs so the results
-;; buffer renders the header in psql-header, rules/footers dim, and errors
-;; red; the babel path joins just the texts (and because the rows ARE org
-;; table syntax, a #+RESULTS: block holds a real org table).
+;; Queries run with SENTINEL separators (`-P recordsep/fieldsep`), so record
+;; and cell boundaries are exact: a value containing a newline or a `|` can't
+;; break its row — EVERY row lands in the table. Each result set becomes an
+;; ORG-MODE table — `| cell | cell |` rows, a `|---+---|` rule under the
+;; header — cells clamped to 80 chars (one fat embedding costs 80 chars, not
+;; megabytes of padding) and embedded newlines shown as ⏎. Footers, timing,
+;; and errors pass through between tables. Produced as (text face) pairs; the
+;; babel path joins just the texts (the rows ARE org table syntax, so a
+;; #+RESULTS: block holds a real org table).
+(define psql--RS "@@RS@@")
+(define psql--FS "@@FS@@")
 (define psql--cell-width 80)
 (define (psql--clamp-cell s)
   (if (> (string-length s) psql--cell-width)
       (string-append (substring s 0 psql--cell-width) "…")
       s))
+(define (psql--flatten-nl s)
+  (if (string-contains? s "\n") (string-join (split-many s "\n") "⏎") s))
+(define (psql--record-cells rec)
+  (map (lambda (c) (psql--clamp-cell (psql--flatten-nl c)))
+       (split-many rec psql--FS)))
 
 ;; One org table row: `| c1 | c2 |`, every cell padded to its column width.
 (define (psql--fmt-cells cells ws)
@@ -758,8 +767,9 @@
               (string-append acc (string-repeat "-" (+ (car ws) 2))
                              (if (null? (cdr ws)) "|" "+"))))))
 
-(define (psql--format-block lines)
-  (let* ((rows (map (lambda (l) (map psql--clamp-cell (split-many l "|"))) lines))
+;; One result set (header record first) → org-table (text face) pairs.
+(define (psql--format-block records)
+  (let* ((rows (map psql--record-cells records))
          (ws (psql--widths rows))
          (formatted (map (lambda (r) (psql--fmt-cells r ws)) rows)))
     (if (< (length formatted) 2)
@@ -768,67 +778,81 @@
               (cons (list (psql--rule ws) "psql-dim")
                     (map (lambda (l) (list l #f)) (cdr formatted)))))))
 
-;; Face for a non-table line: footers and timing dim, errors red.
+;; A line that is psql chatter rather than data: footers, timing, errors.
+(define (psql--meta-line? l)
+  (or (equal? (trim-end l) "")
+      (starts-with? l "(") (starts-with? l "Time:") (starts-with? l "Timing")
+      (starts-with? l "ERROR") (starts-with? l "FATAL") (starts-with? l "NOTICE")
+      (starts-with? l "WARNING") (starts-with? l "DETAIL:") (starts-with? l "HINT:")
+      (starts-with? l "CONTEXT:") (starts-with? l "LINE ") (starts-with? l "psql:")
+      (starts-with? (trim-start l) "^")))
 (define (psql--result-line-face line)
-  (cond ((or (string-contains? line "ERROR:") (string-contains? line "FATAL:")
+  (cond ((or (starts-with? line "ERROR") (starts-with? line "FATAL")
              (starts-with? line "psql:")) "psql-err")
-        ((or (starts-with? line "(") (starts-with? line "Time:")
-             (starts-with? line "Timing ")) "psql-dim")
-        (else #f)))
+        (else "psql-dim")))
 
-;; → list of (text face) display lines.
-(define (psql--faced-lines text)
-  (let loop ((ls (split-many text "\n")) (block '()) (acc '()))
+;; Walk the raw stream: split on the record sentinel; a chunk whose first line
+;; is data extends the current result set (embedded newlines and all); a chunk
+;; opening with meta lines ends the set — the metas pass through and any
+;; remainder line is the NEXT set's header.
+(define (psql--faced-lines raw)
+  (let loop ((chunks (split-many raw psql--RS)) (set '()) (acc '()))
     (define (flush acc)
-      (if (null? block)
+      (if (null? set)
           acc
-          (append (reverse (psql--format-block (reverse block))) acc)))
-    (cond
-     ((null? ls) (reverse (flush acc)))
-     ((string-contains? (car ls) "|")
-      (loop (cdr ls) (cons (car ls) block) acc))
-     (else
-      (loop (cdr ls) '()
-            (cons (list (car ls) (psql--result-line-face (car ls))) (flush acc)))))))
+          (append (reverse (psql--format-block (reverse set)))
+                  (if (null? acc) acc (cons (list "" #f) acc)))))
+    (if (null? chunks)
+        (reverse (flush acc))
+        (let ((ls (split-many (car chunks) "\n")))
+          (if (not (psql--meta-line? (car ls)))
+              (loop (cdr chunks) (cons (car chunks) set) acc)
+              (let walk ((ls ls) (acc (flush acc)))
+                (cond
+                 ((null? ls) (loop (cdr chunks) '() acc))
+                 ((psql--meta-line? (car ls))
+                  (walk (cdr ls)
+                        (if (equal? (trim-end (car ls)) "")
+                            acc
+                            (cons (list (car ls) (psql--result-line-face (car ls))) acc))))
+                 (else
+                  ;; remainder — the next result set's header record
+                  (loop (cdr chunks) (list (string-join ls "\n")) acc)))))))))
 
 ;; Plain-text variant (the org-babel results path).
-(define (psql--format-results text)
-  (string-join (map car (psql--faced-lines text)) "\n"))
+(define (psql--format-results raw)
+  (string-join (map car (psql--faced-lines raw)) "\n"))
 
-;; Indexed (line face) entries for render-buffer, skipping face-less lines.
-(define (psql--face-list pairs)
-  (let loop ((ps pairs) (i 0) (acc '()))
-    (cond ((null? ps) (reverse acc))
-          ((nth (car ps) 1)
-           (loop (cdr ps) (+ i 1) (cons (list i (nth (car ps) 1)) acc)))
-          (else (loop (cdr ps) (+ i 1) acc)))))
+;; Results open as a REAL org file buffer (a temp results.org), not a special
+;; render-buffer — so the tables fontify and behave as genuine org tables, and
+;; every keymap works as in any file (the k8s-yaml pattern). Re-running a
+;; query re-reads the file in place.
+(define (psql--results-file)
+  (string-append (psql--tmpdir) "/macros-psql/results.org"))
 
 (define (psql--run-exit code)
   (let ((user-cancelled (and (async-lane-finish "psql") (not (psql--st 'capped)))))
     (if user-cancelled
         (message "psql: query cancelled")
         (let* ((raw (string-join (reverse (psql--st 'async-out)) "\n"))
-               (pairs (if (psql--blank? raw)
-                          (list (list "(no output)" "psql-dim"))
-                          (psql--faced-lines (trim-end raw))))
+               (out (if (psql--blank? raw)
+                        "(no output)"
+                        (psql--format-results (trim-end raw))))
                ;; 141 = SIGPIPE = head hit the raw-stream backstop
                (note (cond ((psql--st 'capped)
-                            "… truncated at psql-max-rows lines (auto-cancelled) …")
+                            "\n\n… truncated at psql-max-rows lines (auto-cancelled) …")
                            ((equal? code "141")
-                            "… truncated at psql-max-output bytes …")
-                           (else #f)))
-               (all (append
-                     pairs
-                     (if note (list (list "" #f) (list note "psql-warn")) '())))
-               (truncated (if note #t #f)))
+                            "\n\n… truncated at psql-max-output bytes …")
+                           (else "")))
+               (truncated (not (equal? note ""))))
+          (write-file (psql--results-file) (string-append out note "\n"))
           ;; Show results in the OTHER window, so the query stays visible below.
           (when (equal? (current-buffer) "*psql-query*") (other-window))
-          (render-buffer "*psql-results*" "psql-result-mode"
-                         (string-join (map car all) "\n")
-                         (psql--face-list all))
-          (message (cond (truncated "psql: done — output truncated, see *psql-results*")
-                         ((equal? code "0") "psql: done — see *psql-results*")
-                         (else "psql: query failed — see *psql-results*")))))))
+          (kill-buffer-named "results.org")   ; drop a stale view so find-file re-reads
+          (open-file (psql--results-file))
+          (message (cond (truncated "psql: done — output truncated, see results.org")
+                         ((equal? code "0") "psql: done — see results.org")
+                         (else "psql: query failed — see results.org")))))))
 
 ;; C-g in a sql buffer: cancel a live query, else the ordinary keyboard-quit.
 (define-command (psql-query-cancel) (async-lane-quit "psql"))
@@ -854,7 +878,9 @@
               (list "-c" (string-append
                           (psql--sh-quote (psql--command)) " "
                           (if (equal? u "") "" (string-append "-d " (psql--sh-quote u) " "))
-                          "-v FETCH_COUNT=100 -X -q -A -P pager=off -f - 2>&1"
+                          "-v FETCH_COUNT=100 -X -q -A"
+                          " -P recordsep=" psql--RS " -P fieldsep=" psql--FS
+                          " -P pager=off -f - 2>&1"
                           " | head -c " (number->string psql--babel-max-bytes)))
               (string-append body "\n")))
          (out (trim-end (psql--format-results (trim-end (nth r 1)))))

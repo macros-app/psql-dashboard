@@ -175,10 +175,11 @@ any dashboard refresh retries.
 
 ### Results formatting and caps
 
-psql emits results **unaligned** (`-A`) and the package builds an **org-mode
-style table** — the header line in the `psql-header` face, the rule/footers/
-timing dimmed, errors in `psql-err` — clamping every cell to 80 chars (`…`
-marks a clamped cell):
+Queries run with **sentinel record/field separators** (`-P recordsep` /
+`-P fieldsep`), so row and cell boundaries are exact — a value containing a
+newline or a `|` cannot break its row. Every row lands in the table. Each
+result set is formatted as an **org-mode table**, cells clamped to 80 chars
+(`…` marks a clamped cell) and embedded newlines shown as `⏎`:
 
 ```
 | id                                   | use_type | title                 |
@@ -188,9 +189,11 @@ marks a clamped cell):
 Time: 56.981 ms
 ```
 
-Because the rows are org table syntax, results paste straight into org files —
-and a babel `#+RESULTS:` block holds a *real* org table (table lines are
-inserted raw, not `: `-prefixed).
+Results open as a **real org-mode buffer** — a temp `results.org` file — so
+the tables fontify and behave as genuine org tables and every keymap works as
+in any file (re-running a query re-reads it in place). Rows paste straight
+into your org documents, and a babel `#+RESULTS:` block holds a *real* org
+table (table lines are inserted raw, not `: `-prefixed).
 
 This
 is load-bearing, not cosmetic: psql's own aligned format pads every row and
@@ -213,9 +216,6 @@ with `FETCH_COUNT=100` so results stream in batches and the caps cut in
 early. There is **no LIMIT injected**; a huge result set is simply truncated
 at the row cap. Cancel a long-running query with `C-g`.
 
-One cosmetic caveat: values containing literal newlines span display rows
-(unaligned output is line-based), and a literal `|` inside a value reads as a
-column break in the display — the query still runs correctly either way.
 
 ## Org-mode source blocks
 
