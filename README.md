@@ -108,9 +108,26 @@ other backends connected to this database (state, running time, current query).
   indexes).
 - `RET` / `g` on a **table row** → `*psql-table:S.T*` — sizes, row estimate,
   scan and vacuum/analyze stats, then foldable **Columns** (type, null,
-  default), **Indexes** (size, scans, definition), **Constraints**, and — for
+  default), **Distributions** (see below), **Indexes** (size, scans, definition), **Constraints**, and — for
   views and matviews — the **Definition**.
 - `^` goes back up a level (table → schema → dashboard).
+
+## Column distributions
+
+A table's view has a **Distributions** section built from Postgres's own statistics (`pg_stats`), so it costs no table scan:
+
+```
+COLUMN      NULLS  DISTINCT      RANGE                                DISTRIBUTION
+score       10%    90% of rows   18.74 … 82.22                        ▁▃▅▇█▆▄▂▁▁▁▁▁▁▁▁▁▁▁▃▇█▅▂
+latency_ms  0%     44% of rows   0.00 … 459.38                        █▆▄▃▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+created     0%     100% of rows  2026-07-06 11:43 … 2026-10-04 11:18  ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▂▂▂▂▂▂▃█
+```
+
+- **NULLS** and **DISTINCT** come straight from `pg_stats` (`unique` means every row differs).
+- **RANGE** is the lowest and highest histogram boundary.
+- **DISTRIBUTION** is a density sparkline for numeric and date/timestamp columns: where the bars are tall, values are packed close together. It is derived from the column's histogram, which splits values into buckets holding equal numbers of rows.
+
+Statistics exist only after the table has been analyzed (autovacuum does this, or run `ANALYZE`). Columns whose values all fit in the "most common values" list, such as booleans or small enums, have no histogram and so no sparkline. The sparkline column needs an editor with text charts (`plot.scm`); on older editors the section shows the other columns.
 
 ## Keys
 

@@ -444,6 +444,172 @@
         ((equal? c "x") "exclusion")
         (else c)))
 
+;; ── column distributions ────────────────────────────────────────────────────
+;; The table view's Distributions section, from pg_stats (catalog only — no
+;; table scan; needs the table to have been ANALYZEd). For numeric and
+;; date/timestamp columns, pg_stats.histogram_bounds splits the values into
+;; equal-COUNT buckets, so a narrow bucket means dense values: spreading each
+;; bucket's share evenly across its width gives a density curve, drawn as a
+;; sparkline by the editor's plot.scm.
+
+;; plot.scm's sparkline function, or #f on editors without it. Looked up through
+;; eval-string: naming it directly would make this whole file fail to load on
+;; older builds (Steel rejects a unit over one unknown identifier).
+(define psql--sparkline
+  (if (member "plot-sparkline-string" (function-list))
+      (eval-string "plot-sparkline-string")
+      #f))
+(define psql--spark-bins 24)
+
+;; Consecutive pairs of a sorted bounds list: the histogram's buckets.
+(define (psql--buckets bounds)
+  (if (or (null? bounds) (null? (cdr bounds)))
+      '()
+      (cons (list (car bounds) (cadr bounds)) (psql--buckets (cdr bounds)))))
+
+;; Equal-count bucket bounds → `bins` equal-WIDTH densities over [first, last],
+;; or #f when there's no spread to draw. A zero-width bucket (a heavily repeated
+;; value) puts its whole share in the bin holding that value.
+(define (psql--density bounds bins)
+  (let* ((bks (psql--buckets bounds))
+         (lo  (if (null? bounds) 0 (car bounds)))
+         (hi  (if (null? bounds) 0 (last bounds))))
+    (if (or (null? bks) (not (> hi lo)))
+        #f
+        (let ((w (/ (- hi lo) bins)))
+          (let loop ((k 0) (acc '()))
+            (if (= k bins)
+                (reverse acc)
+                (let* ((x0 (+ lo (* k w)))
+                       (end? (= k (- bins 1)))
+                       (x1 (if end? hi (+ x0 w)))
+                       (share
+                        (lambda (bk)
+                          (let ((a (car bk)) (b (cadr bk)))
+                            (if (= a b)
+                                (if (and (>= a x0) (or (< a x1) (and end? (<= a x1)))) 1.0 0.0)
+                                (/ (max 0.0 (- (min b x1) (max a x0))) (- b a)))))))
+                  (loop (+ k 1) (cons (psql--sum (map share bks)) acc)))))))))
+
+;; "12.5,40,99" → (12.5 40 99), dropping anything unparsable.
+(define (psql--number-list s)
+  (filter (lambda (x) x)
+          (map string->number (filter (lambda (x) (not (equal? x ""))) (split-many s ",")))))
+
+;; `n` with exactly two decimals, built from integers — Steel's number->string
+;; can print a rounded float as 18.740000000000002.
+(define (psql--fixed2 n)
+  (let* ((c (inexact->exact (round (* (abs n) 100))))
+         (frac (remainder c 100)))
+    (string-append (if (< n 0) "-" "")
+                   (number->string (quotient c 100)) "."
+                   (if (< frac 10) "0" "") (number->string frac))))
+
+;; A histogram edge, shortened for the RANGE column: long numbers to 2 decimals
+;; (whole numbers from 1000 up), timestamps to the minute; short values as-is.
+(define (psql--short-edge v)
+  (let ((n (string->number v)))
+    (cond ((<= (string-length v) 10) v)
+          (n (if (>= (abs n) 1000)
+                 (number->string (inexact->exact (round n)))
+                 (psql--fixed2 n)))
+          ((and (>= (string-length v) 16) (equal? (substring v 4 5) "-")) (substring v 0 16))
+          (else v))))
+
+;; pg_stats null_frac → "0%", "<1%", "37%".
+(define (psql--null-pct s)
+  (let ((f (string->number s)))
+    (cond ((not f) "")
+          ((= f 0) "0%")
+          ((< f 0.01) "<1%")
+          (else (string-append (number->string (inexact->exact (round (* 100 f)))) "%")))))
+
+;; pg_stats n_distinct: positive = a count; negative = minus the fraction of
+;; rows (-1 = every row distinct).
+(define (psql--distinct s)
+  (let ((n (string->number s)))
+    (cond ((not n) "")
+          ((= n -1) "unique")
+          ((< n 0) (string-append (number->string (inexact->exact (round (* -100 n)))) "% of rows"))
+          (else (number->string (inexact->exact (round n)))))))
+
+;; Per-column stats rows: (null_frac n_distinct min max bounds attname). The
+;; histogram cast is limited to types that convert cleanly — one bad cast would
+;; fail the whole query. min/max are clipped and `|`-free (only the LAST field
+;; may hold a `|`). → rows, or #f if the query failed (never fatal to the view).
+(define (psql--column-stats s t oid)
+  (let* ((arr "s.histogram_bounds::text::text[]")
+         (edge (lambda (i)
+                 (string-append "coalesce(left(replace((" arr ")[" i "], '|', '¦'), 30), '')")))
+         (sql (string-append
+               "select s.null_frac::text, s.n_distinct::text, "
+               (edge "1") ", " (edge (string-append "array_length(" arr ", 1)")) ", "
+               "coalesce(case"
+               " when a.atttypid in ('int2'::regtype, 'int4'::regtype, 'int8'::regtype,"
+               "  'float4'::regtype, 'float8'::regtype, 'numeric'::regtype)"
+               "  then (select string_agg(v::text, ',') from unnest(s.histogram_bounds::text::float8[]) v)"
+               " when a.atttypid in ('date'::regtype, 'timestamp'::regtype, 'timestamptz'::regtype)"
+               "  then (select string_agg(extract(epoch from v)::text, ',')"
+               "        from unnest(s.histogram_bounds::text::timestamptz[]) v)"
+               " end, ''), s.attname"
+               " from pg_stats s"
+               " join pg_attribute a on a.attrelid = " oid " and a.attname = s.attname"
+               " where s.schemaname = '" (psql--sq s) "' and s.tablename = '" (psql--sq t) "'"
+               " and not s.inherited order by a.attnum"))
+         (r (psql--run-full (append (psql--conn)
+                                    (list "-X" "-q" "-A" "-t" "-P" "pager=off" "-c" sql)))))
+    (if (equal? (car r) "0")
+        (map (lambda (ln) (psql--fields-n ln 6)) (psql--lines (nth r 1)))
+        #f)))
+
+;; The Distributions section: one row per analyzed column; the sparkline is the
+;; last cell, colored with an accent over its bytes.
+(define (psql--emit-distributions s t oid)
+  (let ((rows (psql--column-stats s t oid)))
+    (section-open 'psql-distributions
+                  (string-append "Distributions ("
+                                 (if rows (number->string (length rows)) "?") ")")
+                  "psql-section")
+    (cond
+      ((not rows) (section-line "    (statistics unavailable)" "psql-dim"))
+      ((null? rows) (section-line "    (no statistics yet — run ANALYZE)" "psql-dim"))
+      (else
+       (let* ((cells
+               (map (lambda (r)
+                      (let* ((lo (psql--nth-or r 2 ""))
+                             (hi (psql--nth-or r 3 ""))
+                             (dens (if psql--sparkline
+                                       (psql--density (psql--number-list (psql--nth-or r 4 ""))
+                                                      psql--spark-bins)
+                                       #f)))
+                        (append
+                         (list (psql--nth-or r 5 "")
+                               (psql--null-pct (psql--nth-or r 0 ""))
+                               (psql--distinct (psql--nth-or r 1 ""))
+                               (if (equal? lo "")
+                                   ""
+                                   (string-append (psql--short-edge lo) " … " (psql--short-edge hi))))
+                         (if psql--sparkline
+                             (list (if dens (psql--sparkline dens 'min 0) ""))
+                             '()))))
+                    rows))
+              (header (append (list "COLUMN" "NULLS" "DISTINCT" "RANGE")
+                              (if psql--sparkline (list "DISTRIBUTION") '())))
+              (ws (psql--widths (cons header cells))))
+         (section-line (string-append "    " (psql--fmt header ws)) "psql-dim")
+         (for-each
+          (lambda (c)
+            (let* ((b (section-point-byte))
+                   (text (string-append "    " (psql--fmt c ws)))
+                   (spark (if psql--sparkline (nth c 4) ""))
+                   (end (utf8-length text)))
+              (section-line text #f)
+              (when (not (equal? spark ""))
+                (section-accent (+ b (- end (utf8-length spark))) (+ b end) "plot-series-0"))))
+          cells))))
+    (section-close 'psql-distributions)
+    (section-line "" #f)))
+
 (define (psql--render-table s t)
   (let* ((oid (psql--reloid s t))
          (ov (psql--query
@@ -527,6 +693,7 @@
                                    #f #f))
               (section-close 'psql-columns)
               (section-line "" #f)
+              (psql--emit-distributions s t oid)
               ;; indexes
               (section-open 'psql-indexes
                             (string-append "Indexes (" (number->string (length idxs)) ")")
