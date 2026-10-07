@@ -57,9 +57,12 @@
   (let ((v (get-option "psql-command")))
     (if (and (string? v) (not (equal? v ""))) v "psql")))
 
-;; The connection URL:
-;;   (set-option "psql-url" "postgres://user:pass@host:5432/dbname")
-;; Empty / unset = psql's own defaults (PGHOST / PGDATABASE / ~/.pgpass etc.).
+;; The connection URL — leave the password OUT of it:
+;;   (set-option "psql-url" "postgres://user@host:5432/dbname")
+;; The password then comes from the editor's secrets store (authinfo.gpg, see
+;; macros scheme/secrets.scm): asked for once, offered to save, and handed to
+;; psql as PGPASSWORD — never in argv. A URL that does embed `user:pass@` is
+;; used as-is. Empty / unset = psql's own defaults (PGHOST / ~/.pgpass etc.).
 (define (psql--url)
   (let ((v (get-option "psql-url")))
     (if (string? v) v "")))
@@ -175,15 +178,77 @@
         (else (string-append (pad-right (car cells) (car ws)) "  "
                              (psql--fmt (cdr cells) (cdr ws))))))
 
+;; ── password (secrets store) ──────────────────────────────────────────────────
+;; The secrets-store key for a URL: (host user port), or #f when the store
+;; isn't involved — no URL (PG* env / ~/.pgpass), a key=value conninfo string,
+;; a unix-socket URL with no host, or a URL that already carries a password.
+;;   postgres://kyle@db.example.com:5432/app → ("db.example.com" "kyle" "5432")
+(define (psql--url-auth-key u)
+  (let* ((rest (cond ((starts-with? u "postgresql://") (substring u 13 (string-length u)))
+                     ((starts-with? u "postgres://") (substring u 11 (string-length u)))
+                     (else #f))))
+    (and rest
+         (let* ((authority (car (split-many (car (split-many rest "/")) "?")))
+                (at (split-many authority "@"))
+                (creds (if (null? (cdr at)) "" (string-join (reverse (cdr (reverse at))) "@")))
+                (hostport (car (reverse at))))
+           (and (not (string-contains? creds ":"))       ; user:pass@ → used as-is
+                (let* ((v6 (starts-with? hostport "["))
+                       (parts (if v6
+                                  (split-many (substring hostport 1 (string-length hostport)) "]")
+                                  (split-many hostport ":")))
+                       (host (car parts))
+                       (port (cond ((null? (cdr parts)) "")
+                                   (v6 (let ((p (cadr parts)))
+                                         (if (starts-with? p ":") (substring p 1 (string-length p)) "")))
+                                   (else (cadr parts)))))
+                  (and (not (equal? host "")) (list host creds port))))))))
+(define (psql--auth-key) (psql--url-auth-key (psql--url)))
+
+;; Child env for a psql spawn: PGPASSWORD from the secrets store when we have
+;; it (a synchronous lookup — never prompts), else nothing.
+(define (psql--env)
+  (let* ((key (psql--auth-key))
+         (pw (and key (apply secret-lookup key))))
+    (if pw (list (string-append "PGPASSWORD=" pw)) '())))
+
+;; Run `k` once a password is available (or not needed). Gates every command
+;; that talks to the server, so the spawns inside can stay synchronous and
+;; just `psql--env`. Prompts (via secret-get) only on a store/session miss.
+(define (psql--authed k)
+  (let ((key (psql--auth-key)))
+    (if (or (not key) (apply secret-lookup key))
+        (k)
+        (secret-get (car key) (cadr key)
+                    (lambda (_)
+                      ;; a completion catalog fetched without the password failed
+                      (when (equal? (psql--st 'cat-state) "failed") (psql--st! 'cat-state ""))
+                      (k))
+                    'port (nth key 2)
+                    'on-cancel (lambda (_) (message "psql: cancelled (no password)"))))))
+
+;; psql output saying the server rejected (or never got) a password.
+(define (psql--auth-failed? text)
+  (or (string-contains? text "password authentication failed")
+      (string-contains? text "no password supplied")))
+
+;; The stored password was rejected: delete it, so the next command asks again.
+(define (psql--password-rejected)
+  (let ((key (psql--auth-key)))
+    (when key
+      (apply secret-forget key)
+      (message "psql: password rejected — forgotten; run the command again to re-enter it"))))
+
 ;; ── psql plumbing ─────────────────────────────────────────────────────────────
 (define (psql--conn)
   (let ((u (psql--url))) (if (equal? u "") '() (list "-d" u))))
-(define (psql--run-full args) (call-process-full (psql--command) args ""))
+(define (psql--run-full args) (call-process-env (psql--command) args "" (psql--env)))
 
 (define (psql--error stderr)
   (render-buffer "*psql-error*" "psql-result-mode"
                  (if (psql--blank? stderr) "psql failed (no output)" (trim-end stderr)) '())
-  (message "psql failed — see *psql-error*"))
+  (message "psql failed — see *psql-error*")
+  (when (psql--auth-failed? stderr) (psql--password-rejected)))
 
 ;; Run `sql`, parse unaligned tuples into rows of exactly `ncols` fields.
 ;; → a list of rows, or #f after surfacing the error (callers abort on #f).
@@ -736,29 +801,35 @@
               (goto-line line)))))))
 
 ;; ── entry / navigation commands ───────────────────────────────────────────────
-(define-command (psql-dashboard) (psql--render-dashboard))
+(define-command (psql-dashboard) (psql--authed psql--render-dashboard))
 
 ;; Refresh whatever psql buffer we're in.
 (define-command (psql-refresh)
   (let ((v (psql--view (current-buffer))))
-    (cond ((not v) (message "psql: not a psql buffer"))
-          ((equal? (car v) "dashboard") (psql--render-dashboard))
-          ((equal? (car v) "schema")    (psql--render-schema (nth v 1)))
-          ((equal? (car v) "table")     (psql--render-table (nth v 1) (nth v 2))))))
+    (if (not v)
+        (message "psql: not a psql buffer")
+        (psql--authed
+          (lambda ()
+            (cond ((equal? (car v) "dashboard") (psql--render-dashboard))
+                  ((equal? (car v) "schema")    (psql--render-schema (nth v 1)))
+                  ((equal? (car v) "table")     (psql--render-table (nth v 1) (nth v 2)))))))))
 
 ;; RET / g: drill into the thing at point (schema heading → schema buffer,
 ;; table row → table buffer). TAB folds instead — magit muscle memory.
 (define-command (psql-visit)
   (let ((e (psql--at)))
-    (cond ((not e) (message "psql: nothing to open here"))
-          ((equal? (nth e 1) "schema") (psql--render-schema (nth e 2)))
-          ((equal? (nth e 1) "table")  (psql--render-table (nth e 2) (nth e 3))))))
+    (if (not e)
+        (message "psql: nothing to open here")
+        (psql--authed
+          (lambda ()
+            (cond ((equal? (nth e 1) "schema") (psql--render-schema (nth e 2)))
+                  ((equal? (nth e 1) "table")  (psql--render-table (nth e 2) (nth e 3)))))))))
 
 ;; ^: go up a level (table → its schema, schema → dashboard).
 (define-command (psql-up)
   (let ((v (psql--view (current-buffer))))
-    (cond ((and v (equal? (car v) "table"))  (psql--render-schema (nth v 1)))
-          ((and v (equal? (car v) "schema")) (psql--render-dashboard))
+    (cond ((and v (equal? (car v) "table"))  (psql--authed (lambda () (psql--render-schema (nth v 1)))))
+          ((and v (equal? (car v) "schema")) (psql--authed psql--render-dashboard))
           (else (message "psql: already at the top")))))
 
 (define-command (psql-toggle-fold) (section-toggle-at-point))
@@ -854,31 +925,34 @@
      ((psql--blank? sql) (message "psql: buffer is empty"))
      ((async-lane-live? "psql")
       (message "psql: a query is already running — C-g cancels it"))
-     (else
-      (let ((file (psql--query-file))
-            (status (psql--status-file))
-            (u (psql--url)))
-        (write-file file (string-append "\\timing on\n" sql "\n"))
-        (psql--st! 'async-out '())
-        (psql--st! 'async-n 0)
-        (psql--st! 'capped #f)
-        ;; -A = unaligned output (headers + footers kept) — the display table is
-        ;; built by psql--format-results, with per-cell clamping. FETCH_COUNT
-        ;; streams results in batches so the caps can cut a runaway result off
-        ;; early. psql's own exit code is smuggled out through a status file —
-        ;; the pipeline's code is head's, which is always 0.
-        (async-lane-run "psql" "/bin/sh"
-          (list "-c" (string-append
-                      "{ " (psql--sh-quote (psql--command)) " "
-                      (if (equal? u "") "" (string-append "-d " (psql--sh-quote u) " "))
-                      "-v FETCH_COUNT=100 -X -q -A"
-                      " -P recordsep=" psql--RS " -P fieldsep=" psql--FS
-                      " -P pager=off -f " (psql--sh-quote file)
-                      " 2>&1; echo $? > " (psql--sh-quote status)
-                      "; } | head -c " (number->string (psql--max-output))
-                      "; exit \"$(cat " (psql--sh-quote status) ")\""))
-          'psql--run-output 'psql--run-exit)
-        (message "psql: running… (C-g in the query buffer cancels)"))))))
+     (else (psql--authed (lambda () (psql--run-sql sql)))))))
+
+;; The body of psql-run-buffer, once a password (if needed) is in hand.
+(define (psql--run-sql sql)
+  (let ((file (psql--query-file))
+        (status (psql--status-file))
+        (u (psql--url)))
+    (write-file file (string-append "\\timing on\n" sql "\n"))
+    (psql--st! 'async-out '())
+    (psql--st! 'async-n 0)
+    (psql--st! 'capped #f)
+    ;; -A = unaligned output (headers + footers kept) — the display table is
+    ;; built by psql--format-results, with per-cell clamping. FETCH_COUNT
+    ;; streams results in batches so the caps can cut a runaway result off
+    ;; early. psql's own exit code is smuggled out through a status file —
+    ;; the pipeline's code is head's, which is always 0.
+    (async-lane-run "psql" "/bin/sh"
+      (list "-c" (string-append
+                  "{ " (psql--sh-quote (psql--command)) " "
+                  (if (equal? u "") "" (string-append "-d " (psql--sh-quote u) " "))
+                  "-v FETCH_COUNT=100 -X -q -A"
+                  " -P recordsep=" psql--RS " -P fieldsep=" psql--FS
+                  " -P pager=off -f " (psql--sh-quote file)
+                  " 2>&1; echo $? > " (psql--sh-quote status)
+                  "; } | head -c " (number->string (psql--max-output))
+                  "; exit \"$(cat " (psql--sh-quote status) ")\""))
+      'psql--run-output 'psql--run-exit (psql--env))
+    (message "psql: running… (C-g in the query buffer cancels)")))
 
 ;; Accumulate as a reversed LIST and join once on exit — appending each line to
 ;; one growing string is quadratic and crawls on megabyte outputs. Past the row
@@ -1019,7 +1093,9 @@
           (open-file (psql--results-file))
           (message (cond (truncated "psql: done — output truncated, see results.org")
                          ((equal? code "0") "psql: done — see results.org")
-                         (else "psql: query failed — see results.org")))))))
+                         (else "psql: query failed — see results.org")))
+          (when (and (not (equal? code "0")) (psql--auth-failed? raw))
+            (psql--password-rejected))))))
 
 ;; C-g in a sql buffer: cancel a live query, else the ordinary keyboard-quit.
 (define-command (psql-query-cancel) (async-lane-quit "psql"))
@@ -1041,7 +1117,7 @@
 
 (define (psql--babel-run body)
   (let* ((u (psql--url))
-         (r (call-process-full "/bin/sh"
+         (r (call-process-env "/bin/sh"
               (list "-c" (string-append
                           (psql--sh-quote (psql--command)) " "
                           (if (equal? u "") "" (string-append "-d " (psql--sh-quote u) " "))
@@ -1049,7 +1125,8 @@
                           " -P recordsep=" psql--RS " -P fieldsep=" psql--FS
                           " -P pager=off -f - 2>&1"
                           " | head -c " (number->string psql--babel-max-bytes)))
-              (string-append body "\n")))
+              (string-append body "\n")
+              (psql--env)))
          (out (trim-end (psql--format-results (trim-end (nth r 1)))))
          (rows (split-many out "\n"))
          (capped (> (length rows) (psql--max-rows)))
@@ -1151,11 +1228,13 @@
   (when (equal? (psql--st 'cat-state) "") (psql--catalog-refresh!)))
 
 (define-command (psql-catalog-refresh)
-  (psql--catalog-refresh!)
-  (message (if (equal? (psql--st 'cat-state) "ok")
-               (string-append "psql: catalog cached ("
-                              (number->string (length (psql--st 'cat-tables))) " relations)")
-               "psql: catalog fetch failed — check psql-url")))
+  (psql--authed
+    (lambda ()
+      (psql--catalog-refresh!)
+      (message (if (equal? (psql--st 'cat-state) "ok")
+                   (string-append "psql: catalog cached ("
+                                  (number->string (length (psql--st 'cat-tables))) " relations)")
+                   "psql: catalog fetch failed — check psql-url")))))
 
 ;; Only complete in SQL buffers: the query pane, or any real .sql file.
 (define (psql--sql-buffer?)

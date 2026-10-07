@@ -29,24 +29,40 @@ Add this to your `init.scm` — the package is cloned from git on first launch:
 
 ```scheme
 (package-install "https://github.com/kylegwinnup/macros-psql-dashboard"
-  'config (lambda () (set-option "psql-url" "postgres://user:pass@localhost:5432/mydb")))
+  'config (lambda () (set-option "psql-url" "postgres://user@localhost:5432/mydb")))
 ```
 
 Or, while developing, load it in place:
 
 ```scheme
 (package-install-local "~/workspace/macros-psql-dashboard"
-  'config (lambda () (set-option "psql-url" "postgres://user:pass@localhost:5432/mydb")))
+  'config (lambda () (set-option "psql-url" "postgres://user@localhost:5432/mydb")))
 ```
 
 ## Configuration
 
 The connection URL lives in the editor's **option store** (order-independent —
-set it any time):
+set it any time). Leave the password out of it:
 
 ```scheme
-(set-option "psql-url" "postgres://user:pass@host:5432/dbname")
+(set-option "psql-url" "postgres://user@host:5432/dbname")
 ```
+
+### Passwords
+
+The password comes from the editor's secrets store, `~/.config/macros/authinfo.gpg`
+(one file encrypted with a master passphrase, shared by every package). The
+first command that talks to the server asks for the master passphrase once per
+session, then looks up `machine host login user port 5432`. If there's no
+entry, it asks for the password and offers to save it. psql gets the password
+through `PGPASSWORD` in its environment, never on the command line, where `ps`
+would show it. If the server rejects it, the entry is deleted and the next
+command asks again. A password you choose not to save is remembered until you
+quit or run `M-x secrets-lock`.
+
+You can also add one ahead of time with `M-x secrets-add`. A URL that embeds
+`user:pass@` is still used as-is, and with no URL (or a key=value conninfo
+string) psql's own `~/.pgpass` / `PGPASSWORD` handling applies.
 
 Anything `psql -d` accepts works (a URL or a key/value conninfo string). If the
 option is empty or unset, `psql` falls back to its own defaults — `PGHOST`,
