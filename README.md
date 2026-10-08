@@ -1,6 +1,6 @@
 # macros-psql-dashboard
 
-A PostgreSQL dashboard for the [macros](https://github.com/kylegwinnup/macros)
+A PostgreSQL dashboard for the [macros](https://codeberg.org/macros-app/macros)
 editor, written in Steel — a magit-style porcelain for `psql`.
 
 One read-only, foldable dashboard shows the database at a glance: every schema
@@ -19,7 +19,7 @@ pane), and `lib-transient` (the `?` popup).
 
 ## Requirements
 
-- The [macros](https://github.com/kylegwinnup/macros) editor.
+- The [macros](https://codeberg.org/macros-app/macros) editor.
 - `psql` on your `PATH` (any reasonably recent PostgreSQL client; the catalog
   queries need server ≥ 9.4).
 
@@ -28,7 +28,8 @@ pane), and `lib-transient` (the `?` popup).
 Add this to your `init.scm` — the package is cloned from git on first launch:
 
 ```scheme
-(package-install "https://github.com/kylegwinnup/macros-psql-dashboard"
+(package-install "https://codeberg.org/macros-app/psql-dashboard"
+  'name "macros-psql-dashboard"      ; the entry file is macros-psql-dashboard.scm
   'config (lambda () (set-option "psql-url" "postgres://user@localhost:5432/mydb")))
 ```
 
@@ -47,20 +48,21 @@ secrets store, `~/.config/macros/authinfo.gpg` (one file encrypted with a
 master passphrase, shared by every package):
 
 ```scheme
-(package-install-local "~/workspace/macros-psql-dashboard"
+(package-install "https://codeberg.org/macros-app/psql-dashboard"
+  'name "macros-psql-dashboard"      ; the entry file is macros-psql-dashboard.scm
   'config (lambda ()
             (set-option "psql-command" "/opt/homebrew/opt/libpq/bin/psql")
-            (set-option "psql-url" (secret-get "psql-url-1" "kyle"))
+            (set-option "psql-url" (secret-get "psql-url-1" "alice"))
             #f))
 ```
 
-`(secret-get "psql-url-1" "kyle")` names the entry `machine psql-url-1 login
-kyle`. Only that reference is stored, never the URL. The first command that
+`(secret-get "psql-url-1" "alice")` names the entry `machine psql-url-1 login
+alice`. Only that reference is stored, never the URL. The first command that
 talks to the server asks for the master passphrase (once per session). If
 there's no entry yet, it asks for the URL itself, masked, as
-`psql-url (kyle@psql-url-1):`, and offers to save it. Until then nothing runs
+`psql-url (alice@psql-url-1):`, and offers to save it. Until then nothing runs
 against psql's default database: commands prompt, and the dashboard header
-shows `(secret kyle@psql-url-1 — locked)`.
+shows `(secret alice@psql-url-1 — locked)`.
 
 Or keep the URL in plain config and only the password secret:
 
@@ -119,10 +121,10 @@ The package adds **no global keybindings**. Bind it yourself if you want a key
 ## The dashboard
 
 ```
-Database: mydb   PostgreSQL 16.3   postgres://kyle:***@localhost:5432/mydb
-Size: 7509 kB   User: kyle   Connections: 5 (1 active)
+Database: mydb   PostgreSQL 16.3   postgres://alice:***@localhost:5432/mydb
+Size: 7509 kB   User: alice   Connections: 5 (1 active)
 
-public  (12 relations · 1.2 GB · kyle)
+public  (12 relations · 1.2 GB · alice)
     NAME       TYPE   ~ROWS  SIZE
     events     table  4.1M   890.0 MB
     users      table  1.5k   80.0 KB
@@ -130,7 +132,7 @@ public  (12 relations · 1.2 GB · kyle)
 
 Activity (1)
     PID  USER  STATE   TIME      QUERY
-    123  kyle  active  00:00:01  select …
+    123  alice  active  00:00:01  select …
 ```
 
 Each schema is a foldable section listing its relations sorted by size —

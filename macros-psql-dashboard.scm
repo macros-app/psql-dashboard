@@ -62,7 +62,7 @@
 ;; and it comes from the editor's secrets store (authinfo.gpg, see macros
 ;; scheme/secrets.scm) — asked for once, offered to save — or keep the WHOLE
 ;; URL in the store:
-;;   (set-option "psql-url" (secret-get "psql-url-1" "kyle"))
+;;   (set-option "psql-url" (secret-get "psql-url-1" "alice"))
 ;; which is asked for (and offered to save) the first time a command needs it.
 ;; Either way psql gets the password as PGPASSWORD, never in argv: a
 ;; `user:pass@` URL is split before spawning. Empty / unset = psql's own
@@ -189,7 +189,7 @@
 ;; The secrets-store key for a URL: (host user port), or #f when the store
 ;; isn't involved — no URL (PG* env / ~/.pgpass), a key=value conninfo string,
 ;; a unix-socket URL with no host, or a URL that already carries a password.
-;;   postgres://kyle@db.example.com:5432/app → ("db.example.com" "kyle" "5432")
+;;   postgres://alice@db.example.com:5432/app → ("db.example.com" "alice" "5432")
 (define (psql--url-auth-key u)
   (let* ((rest (cond ((starts-with? u "postgresql://") (substring u 13 (string-length u)))
                      ((starts-with? u "postgres://") (substring u 11 (string-length u)))
@@ -213,7 +213,7 @@
 (define (psql--auth-key) (psql--url-auth-key (psql--url)))
 
 ;; Split a URL's embedded password out: → (url-for-argv password-or-#f).
-;;   postgres://kyle:p%40ss@db/app → ("postgres://kyle@db/app" "p@ss")
+;;   postgres://alice:p%40ss@db/app → ("postgres://alice@db/app" "p@ss")
 ;; The password is percent-decoded (as psql itself would); anything that isn't
 ;; a postgres:// URL with `user:pass@` comes back unchanged with #f.
 (define (psql--url-split u)
