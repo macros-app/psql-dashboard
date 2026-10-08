@@ -57,12 +57,16 @@
   (let ((v (get-option "psql-command")))
     (if (and (string? v) (not (equal? v ""))) v "psql")))
 
-;; The connection URL — leave the password OUT of it:
+;; The connection URL. Either leave the password OUT of it:
 ;;   (set-option "psql-url" "postgres://user@host:5432/dbname")
-;; The password then comes from the editor's secrets store (authinfo.gpg, see
-;; macros scheme/secrets.scm): asked for once, offered to save, and handed to
-;; psql as PGPASSWORD — never in argv. A URL that does embed `user:pass@` is
-;; used as-is. Empty / unset = psql's own defaults (PGHOST / ~/.pgpass etc.).
+;; and it comes from the editor's secrets store (authinfo.gpg, see macros
+;; scheme/secrets.scm) — asked for once, offered to save — or keep the WHOLE
+;; URL in the store:
+;;   (set-option "psql-url" (secret-get "psql-url-1" "kyle"))
+;; which is asked for (and offered to save) the first time a command needs it.
+;; Either way psql gets the password as PGPASSWORD, never in argv: a
+;; `user:pass@` URL is split before spawning. Empty / unset = psql's own
+;; defaults (PGHOST / ~/.pgpass etc.).
 (define (psql--url)
   (let ((v (get-option "psql-url")))
     (if (string? v) v "")))
@@ -137,8 +141,11 @@
                   url))
             url))))
 (define (psql--display-url)
-  (let ((u (psql--url)))
-    (if (equal? u "") "(PG* environment)" (psql--redact u))))
+  (let ((u (psql--url))
+        (secret (option-secret-label "psql-url")))
+    (cond ((psql--url-locked?) (string-append "(secret " secret " — locked)"))
+          ((equal? u "") "(PG* environment)")
+          (else (psql--redact u)))))
 
 ;; ── human-readable sizes / counts ─────────────────────────────────────────────
 ;; "x.y<unit>" from a value scaled to tenths (integer math — no floats needed).
@@ -205,27 +212,69 @@
                   (and (not (equal? host "")) (list host creds port))))))))
 (define (psql--auth-key) (psql--url-auth-key (psql--url)))
 
-;; Child env for a psql spawn: PGPASSWORD from the secrets store when we have
-;; it (a synchronous lookup — never prompts), else nothing.
+;; Split a URL's embedded password out: → (url-for-argv password-or-#f).
+;;   postgres://kyle:p%40ss@db/app → ("postgres://kyle@db/app" "p@ss")
+;; The password is percent-decoded (as psql itself would); anything that isn't
+;; a postgres:// URL with `user:pass@` comes back unchanged with #f.
+(define (psql--url-split u)
+  (let ((prefix (cond ((starts-with? u "postgresql://") "postgresql://")
+                      ((starts-with? u "postgres://") "postgres://")
+                      (else #f))))
+    (if (not prefix)
+        (list u #f)
+        (let* ((rest (substring u (string-length prefix) (string-length u)))
+               (slash (split-many rest "/"))
+               (at (split-many (car slash) "@")))
+          (if (null? (cdr at))
+              (list u #f)
+              (let* ((creds (string-join (reverse (cdr (reverse at))) "@"))
+                     (hostport (car (reverse at)))
+                     (colon (split-many creds ":")))
+                (if (null? (cdr colon))
+                    (list u #f)
+                    (list (string-append prefix (car colon) "@" hostport
+                                         (if (null? (cdr slash))
+                                             ""
+                                             (string-append "/" (string-join (cdr slash) "/"))))
+                          (url-decode (string-join (cdr colon) ":"))))))))))
+
+;; The URL as psql's argv sees it: never with a password in it.
+(define (psql--conn-url) (car (psql--url-split (psql--url))))
+
+;; psql-url is a secret reference whose value isn't available yet (store
+;; locked / never entered): spawning now would silently hit psql's DEFAULT
+;; database, so the plumbing refuses instead and the gated commands prompt.
+(define (psql--url-locked?)
+  (and (option-secret-label "psql-url") (not (string? (get-option "psql-url")))))
+
+;; Child env for a psql spawn: the URL's own password, else the secrets
+;; store's (a synchronous lookup — never prompts), else nothing.
 (define (psql--env)
-  (let* ((key (psql--auth-key))
-         (pw (and key (apply secret-lookup key))))
+  (let* ((from-url (cadr (psql--url-split (psql--url))))
+         (key (psql--auth-key))
+         (pw (or from-url (and key (apply secret-lookup key)))))
     (if pw (list (string-append "PGPASSWORD=" pw)) '())))
 
-;; Run `k` once a password is available (or not needed). Gates every command
-;; that talks to the server, so the spawns inside can stay synchronous and
-;; just `psql--env`. Prompts (via secret-get) only on a store/session miss.
+;; Run `k` once the URL and its password are available (or not needed). Gates
+;; every command that talks to the server, so the spawns inside can stay
+;; synchronous and just `psql--env`. Prompts only on a store/session miss:
+;; first for a secret-reference URL itself, then for a password-less URL's
+;; password.
 (define (psql--authed k)
-  (let ((key (psql--auth-key)))
-    (if (or (not key) (apply secret-lookup key))
-        (k)
-        (secret-get (car key) (cadr key)
-                    (lambda (_)
-                      ;; a completion catalog fetched without the password failed
-                      (when (equal? (psql--st 'cat-state) "failed") (psql--st! 'cat-state ""))
-                      (k))
-                    'port (nth key 2)
-                    'on-cancel (lambda (_) (message "psql: cancelled (no password)"))))))
+  (let ((cancelled (lambda (what) (lambda (_) (message (string-append "psql: cancelled (no " what ")"))))))
+    (option-ensure "psql-url"
+      (lambda ()
+        (let ((key (psql--auth-key)))
+          (if (or (not key) (apply secret-lookup key))
+              (k)
+              (secret-get (car key) (cadr key)
+                          (lambda (_)
+                            ;; a completion catalog fetched without the password failed
+                            (when (equal? (psql--st 'cat-state) "failed") (psql--st! 'cat-state ""))
+                            (k))
+                          'port (nth key 2)
+                          'on-cancel (cancelled "password")))))
+      'on-cancel (cancelled "psql-url"))))
 
 ;; psql output saying the server rejected (or never got) a password.
 (define (psql--auth-failed? text)
@@ -233,16 +282,25 @@
       (string-contains? text "no password supplied")))
 
 ;; The stored password was rejected: delete it, so the next command asks again.
+;; A password-less URL's own entry goes; for a URL that came from the store
+;; WITH its password inside, the URL entry goes (re-enter the whole URL).
 (define (psql--password-rejected)
   (let ((key (psql--auth-key)))
-    (when key
-      (apply secret-forget key)
-      (message "psql: password rejected — forgotten; run the command again to re-enter it"))))
+    (cond (key
+           (apply secret-forget key)
+           (message "psql: password rejected — forgotten; run the command again to re-enter it"))
+          ((option-secret-forget "psql-url")
+           (message "psql: password rejected — the stored psql-url was forgotten; run the command again to re-enter it")))))
 
 ;; ── psql plumbing ─────────────────────────────────────────────────────────────
 (define (psql--conn)
-  (let ((u (psql--url))) (if (equal? u "") '() (list "-d" u))))
-(define (psql--run-full args) (call-process-env (psql--command) args "" (psql--env)))
+  (let ((u (psql--conn-url))) (if (equal? u "") '() (list "-d" u))))
+(define psql--locked-error
+  "psql-url is a secret that isn't available yet — run a psql command (e.g. M-x psql-dashboard) to enter it")
+(define (psql--run-full args)
+  (if (psql--url-locked?)
+      (list "1" "" psql--locked-error)
+      (call-process-env (psql--command) args "" (psql--env))))
 
 (define (psql--error stderr)
   (render-buffer "*psql-error*" "psql-result-mode"
@@ -931,7 +989,7 @@
 (define (psql--run-sql sql)
   (let ((file (psql--query-file))
         (status (psql--status-file))
-        (u (psql--url)))
+        (u (psql--conn-url)))
     (write-file file (string-append "\\timing on\n" sql "\n"))
     (psql--st! 'async-out '())
     (psql--st! 'async-n 0)
@@ -1116,7 +1174,11 @@
 (define psql--babel-max-bytes 1000000)
 
 (define (psql--babel-run body)
-  (let* ((u (psql--url))
+  (if (psql--url-locked?)
+      psql--locked-error
+      (psql--babel-run-unlocked body)))
+(define (psql--babel-run-unlocked body)
+  (let* ((u (psql--conn-url))
          (r (call-process-env "/bin/sh"
               (list "-c" (string-append
                           (psql--sh-quote (psql--command)) " "
@@ -1224,8 +1286,12 @@
     (if rows
         (psql--catalog-build! rows)
         (psql--st! 'cat-state "failed"))))
+;; Not while psql-url is a locked secret: that's "not yet", not "failed" (a
+;; failure sticks until psql-catalog-refresh), so completion retries once a
+;; command has unlocked it.
 (define (psql--catalog-ensure!)
-  (when (equal? (psql--st 'cat-state) "") (psql--catalog-refresh!)))
+  (when (and (equal? (psql--st 'cat-state) "") (not (psql--url-locked?)))
+    (psql--catalog-refresh!)))
 
 (define-command (psql-catalog-refresh)
   (psql--authed

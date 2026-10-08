@@ -42,7 +42,27 @@ Or, while developing, load it in place:
 ## Configuration
 
 The connection URL lives in the editor's **option store** (order-independent —
-set it any time). Leave the password out of it:
+set it any time). The simplest setup keeps the **whole URL** in the editor's
+secrets store, `~/.config/macros/authinfo.gpg` (one file encrypted with a
+master passphrase, shared by every package):
+
+```scheme
+(package-install-local "~/workspace/macros-psql-dashboard"
+  'config (lambda ()
+            (set-option "psql-command" "/opt/homebrew/opt/libpq/bin/psql")
+            (set-option "psql-url" (secret-get "psql-url-1" "kyle"))
+            #f))
+```
+
+`(secret-get "psql-url-1" "kyle")` names the entry `machine psql-url-1 login
+kyle`. Only that reference is stored, never the URL. The first command that
+talks to the server asks for the master passphrase (once per session). If
+there's no entry yet, it asks for the URL itself, masked, as
+`psql-url (kyle@psql-url-1):`, and offers to save it. Until then nothing runs
+against psql's default database: commands prompt, and the dashboard header
+shows `(secret kyle@psql-url-1 — locked)`.
+
+Or keep the URL in plain config and only the password secret:
 
 ```scheme
 (set-option "psql-url" "postgres://user@host:5432/dbname")
@@ -50,19 +70,20 @@ set it any time). Leave the password out of it:
 
 ### Passwords
 
-The password comes from the editor's secrets store, `~/.config/macros/authinfo.gpg`
-(one file encrypted with a master passphrase, shared by every package). The
-first command that talks to the server asks for the master passphrase once per
-session, then looks up `machine host login user port 5432`. If there's no
-entry, it asks for the password and offers to save it. psql gets the password
-through `PGPASSWORD` in its environment, never on the command line, where `ps`
-would show it. If the server rejects it, the entry is deleted and the next
-command asks again. A password you choose not to save is remembered until you
-quit or run `M-x secrets-lock`.
+Either way, psql gets the password through `PGPASSWORD` in its environment,
+never on the command line, where `ps` would show it. A URL with
+`user:pass@` in it, whether stored or plain, is split before psql runs, and
+the percent-encoded password is decoded.
 
-You can also add one ahead of time with `M-x secrets-add`. A URL that embeds
-`user:pass@` is still used as-is, and with no URL (or a key=value conninfo
-string) psql's own `~/.pgpass` / `PGPASSWORD` handling applies.
+A URL without a password looks up `machine host login user port 5432` in the
+same store. If there's no entry, it asks for the password and offers to save
+it. If the server rejects the password, the entry it came from is deleted (the
+password entry, or the stored URL) and the next command asks again. A value you
+choose not to save is remembered until you quit or run `M-x secrets-lock`.
+
+You can also add entries ahead of time with `M-x secrets-add`. With no URL (or
+a key=value conninfo string), psql's own `~/.pgpass` / `PGPASSWORD` handling
+applies.
 
 Anything `psql -d` accepts works (a URL or a key/value conninfo string). If the
 option is empty or unset, `psql` falls back to its own defaults — `PGHOST`,
