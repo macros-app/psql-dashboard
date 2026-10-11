@@ -1524,6 +1524,13 @@
   (let ((v (get-option "psql-results-view")))
     (if (and (string? v) (equal? v "org")) "org" "grid")))
 
+;; C-c C-c is usually pressed mid-typing in the query pane, so the results
+;; would open in insert state — and a grid's vim keys only live in the
+;; normal-state overlay. Results are for reading: drop to normal state.
+(define (psql--normal-state)
+  (cond ((evil-enabled?) (evil-normal-state))
+        ((helix-enabled?) (helix-normal-state))))
+
 ;; open-file's own "Visiting …" lands after anything said in the same command,
 ;; so the summary is said a beat later.
 (define (psql--say-later text)
@@ -1539,6 +1546,7 @@
     (when (equal? (current-buffer) "*psql-query*") (other-window))
     (kill-buffer-named "results.org")   ; drop a stale view so find-file re-reads
     (open-file (psql--results-file))
+    (psql--normal-state)
     (psql--say-later (cond ((not (equal? note "")) (string-append "psql: done — " note ", see results.org"))
                    ((equal? code "0") "psql: done — see results.org")
                    (else "psql: query failed — see results.org")))))
@@ -1572,6 +1580,7 @@
   (when (equal? (current-buffer) "*psql-query*") (other-window))
   (kill-buffer-named "psql-result.csv")   ; drop a stale grid so it re-reads
   (open-file (psql--grid-file 0))
+  (psql--normal-state)
   (let* ((rows (filter (lambda (l) (and (starts-with? l "(") (string-contains? l "row"))) metas))
          (times (filter (lambda (l) (starts-with? l "Time:")) metas))
          (parts (append (if (null? rows) '() (list (car (reverse rows))))
