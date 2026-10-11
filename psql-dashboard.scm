@@ -180,10 +180,23 @@
   (let ((u (psql--url))) (if (equal? u "") '() (list "-d" u))))
 (define (psql--run-full args) (call-process-full (psql--command) args ""))
 
-(define (psql--error stderr)
-  (render-buffer "*psql-error*" "psql-result-mode"
-                 (if (psql--blank? stderr) "psql failed (no output)" (trim-end stderr)) '())
-  (message "psql failed — see *psql-error*"))
+;; The psql binary couldn't be started. call-process-full reports a spawn
+;; failure as exit "-1" with the bare OS error ("No such file or directory");
+;; the /bin/sh paths (query pane, babel) see the shell's exit 127 instead.
+(define (psql--not-found? code) (or (equal? code "-1") (equal? code "127")))
+(define (psql--not-found-msg)
+  (string-append "psql: can't run \"" (psql--command) "\" — set the psql-command"
+                 " option to your psql binary's full path (the GUI editor doesn't"
+                 " inherit your shell PATH), e.g."
+                 " (set-option \"psql-command\" \"/opt/homebrew/opt/libpq/bin/psql\")"))
+
+(define (psql--error code stderr)
+  (if (psql--not-found? code)
+      (message (psql--not-found-msg))
+      (begin
+        (render-buffer "*psql-error*" "psql-result-mode"
+                       (if (psql--blank? stderr) "psql failed (no output)" (trim-end stderr)) '())
+        (message "psql failed — see *psql-error*"))))
 
 ;; Run `sql`, parse unaligned tuples into rows of exactly `ncols` fields.
 ;; → a list of rows, or #f after surfacing the error (callers abort on #f).
@@ -192,7 +205,7 @@
                                    (list "-X" "-q" "-A" "-t" "-P" "pager=off" "-c" sql)))))
     (if (equal? (car r) "0")
         (map (lambda (ln) (psql--fields-n ln ncols)) (psql--lines (nth r 1)))
-        (begin (psql--error (nth r 2)) #f))))
+        (begin (psql--error (car r) (nth r 2)) #f))))
 ;; Raw stdout of `sql` (for multi-line single values like a view definition).
 (define (psql--raw sql)
   (let ((r (psql--run-full (append (psql--conn)
@@ -832,8 +845,10 @@
 
 (define (psql--run-exit code)
   (let ((user-cancelled (and (async-lane-finish "psql") (not (psql--st 'capped)))))
-    (if user-cancelled
-        (message "psql: query cancelled")
+    (cond
+     (user-cancelled (message "psql: query cancelled"))
+     ((psql--not-found? code) (message (psql--not-found-msg)))
+     (else
         (let* ((raw (string-join (reverse (psql--st 'async-out)) "\n"))
                (out (if (psql--blank? raw)
                         "(no output)"
@@ -852,7 +867,7 @@
           (open-file (psql--results-file))
           (message (cond (truncated "psql: done — output truncated, see results.org")
                          ((equal? code "0") "psql: done — see results.org")
-                         (else "psql: query failed — see results.org")))))))
+                         (else "psql: query failed — see results.org"))))))))
 
 ;; C-g in a sql buffer: cancel a live query, else the ordinary keyboard-quit.
 (define-command (psql-query-cancel) (async-lane-quit "psql"))
@@ -876,6 +891,9 @@
   (let* ((u (psql--url))
          (r (call-process-full "/bin/sh"
               (list "-c" (string-append
+                          ;; the pipeline's code is head's — check up front so a
+                          ;; missing binary still surfaces as 127
+                          "command -v " (psql--sh-quote (psql--command)) " >/dev/null || exit 127; "
                           (psql--sh-quote (psql--command)) " "
                           (if (equal? u "") "" (string-append "-d " (psql--sh-quote u) " "))
                           "-v FETCH_COUNT=100 -X -q -A"
@@ -883,7 +901,9 @@
                           " -P pager=off -f - 2>&1"
                           " | head -c " (number->string psql--babel-max-bytes)))
               (string-append body "\n")))
-         (out (trim-end (psql--format-results (trim-end (nth r 1)))))
+         (out (if (psql--not-found? (car r))
+                  (psql--not-found-msg)
+                  (trim-end (psql--format-results (trim-end (nth r 1))))))
          (rows (split-many out "\n"))
          (capped (> (length rows) (psql--max-rows)))
          (shown (if capped
