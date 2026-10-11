@@ -1,4 +1,4 @@
-# macros-psql-dashboard
+# psql-dashboard
 
 A PostgreSQL dashboard for the [macros](https://github.com/kylegwinnup/macros)
 editor, written in Steel — a magit-style porcelain for `psql`.
@@ -28,14 +28,14 @@ pane), and `lib-transient` (the `?` popup).
 Add this to your `init.scm` — the package is cloned from git on first launch:
 
 ```scheme
-(package-install "https://github.com/kylegwinnup/macros-psql-dashboard"
+(package-install "https://github.com/macros-app/psql-dashboard"
   'config (lambda () (set-option "psql-url" "postgres://user:pass@localhost:5432/mydb")))
 ```
 
 Or, while developing, load it in place:
 
 ```scheme
-(package-install-local "~/workspace/macros-psql-dashboard"
+(package-install-local "~/workspace/psql-dashboard"
   'config (lambda () (set-option "psql-url" "postgres://user:pass@localhost:5432/mydb")))
 ```
 

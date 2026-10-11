@@ -1,4 +1,4 @@
-;;; macros-psql-dashboard — a PostgreSQL dashboard for the macros editor, in Steel.
+;;; psql-dashboard — a PostgreSQL dashboard for the macros editor, in Steel.
 ;;;
 ;;; A magit-style porcelain for `psql`. The Rust core knows nothing about
 ;;; Postgres — the package sits on the same editor primitives magit / macros-k8s
