@@ -121,6 +121,8 @@
    'timer-armed #f  ; is a tick scheduled?
    'quiet       #f  ; rendering from a tick (skip the catalog refresh)
    'pending-msg ""  ; echo-area summary shown after a results file opens
+   'back        '() ; buffer -> the psql buffer RET opened it from (for q)
+   'grid-widths '() ; column widths (chars) for the result grid being opened
    ))
 (define (psql--st key) (hash-try-get psql-state key))
 (define (psql--st! key val) (set! psql-state (hash-insert psql-state key val)))
@@ -1158,14 +1160,33 @@
 
 ;; RET / g: drill into the thing at point (schema heading → schema buffer,
 ;; table row → table buffer). TAB folds instead — magit muscle memory.
+;; The buffer RET came from is remembered, so q in the opened buffer returns
+;; there (dashboard → table → a table reached through a foreign key → q → q).
 (define-command (psql-visit)
-  (let ((e (psql--at)))
+  (let ((e (psql--at)) (from (current-buffer)))
     (if (not e)
         (message "psql: nothing to open here")
         (psql--with-url
           (lambda ()
-            (cond ((equal? (nth e 1) "schema") (psql--render-schema (nth e 2)))
-                  ((equal? (nth e 1) "table")  (psql--render-table (nth e 2) (nth e 3)))))))))
+            (cond ((equal? (nth e 1) "schema")
+                   (psql--set-back! (psql--schema-buffer (nth e 2)) from)
+                   (psql--render-schema (nth e 2)))
+                  ((equal? (nth e 1) "table")
+                   (psql--set-back! (psql--table-buffer (nth e 2) (nth e 3)) from)
+                   (psql--render-table (nth e 2) (nth e 3)))))))))
+
+(define (psql--set-back! buf from)
+  (unless (equal? buf from)
+    (psql--st! 'back (psql--alist-set (psql--st 'back) buf from))))
+;; q: close this buffer and return to the one RET opened it from (if it's
+;; still open); the dashboard itself just closes.
+(define-command (psql-quit)
+  (let* ((buf (current-buffer))
+         (back (alist-ref (psql--st 'back) buf)))
+    (psql--st! 'back (filter (lambda (kv) (not (equal? (car kv) buf))) (psql--st 'back)))
+    (kill-buffer)
+    (when (and back (member back (buffer-names)))
+      (switch-to-buffer back))))
 
 ;; ^: go up a level (table → its schema, schema → dashboard).
 (define-command (psql-up)
@@ -1542,6 +1563,7 @@
                "\n"))
 
 (define (psql--show-grid sets metas note)
+  (psql--st! 'grid-widths (psql--grid-widths (car (reverse sets))))
   (let loop ((ss sets) (i 1))
     (when (pair? ss)
       (write-file (psql--grid-file (if (null? (cdr ss)) 0 i))
@@ -1561,11 +1583,26 @@
                         (if (equal? note "") '() (list note)))))
     (psql--say-later (string-append "psql: " (if (null? parts) "done" (string-join parts " · "))))))
 
-;; Header row + frozen header for our result grids.
+;; Column widths for a result set, in px at 100% zoom: the longest value
+;; (header included, capped at 60 chars) at ~8 px a character plus padding —
+;; the grid's default width cuts off most real values.
+(define (psql--grid-widths records)
+  (psql--widths (map (lambda (rec)
+                       (map (lambda (c) (if (> (string-length c) 60) (substring c 0 60) c))
+                            (split-many rec psql--FS)))
+                     records)))
+(define (psql--grid-px n) (+ 16 (* 8 (max n 4))))
+
+;; Header row, frozen header, and fitted columns for our result grids.
 (define (psql--grid-load name)
   (when (starts-with? name "psql-result")
     (grid-set-header #t)
-    (grid-freeze-rows 1)))
+    (grid-freeze-rows 1)
+    (when (equal? name "psql-result.csv")
+      (let loop ((ws (psql--st 'grid-widths)) (i 0))
+        (when (pair? ws)
+          (grid-set-column-width i (psql--grid-px (car ws)))
+          (loop (cdr ws) (+ i 1)))))))
 (remove-hook "grid-load-hook" "psql--grid-load")
 (add-hook "grid-load-hook" "psql--grid-load")
 
@@ -1846,7 +1883,7 @@
 (define-key "psql-mode" "?" 'psql-dispatch)
 (define-key "psql-mode" "n" 'next-line)
 (define-key "psql-mode" "p" 'previous-line)
-(define-key "psql-mode" "q" 'kill-buffer)
+(define-key "psql-mode" "q" 'psql-quit)
 
 ;; Results / error buffers: read-only scroll + copy.
 (set-option "line-numbers:psql-result-mode" "false")

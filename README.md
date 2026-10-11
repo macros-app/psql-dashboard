@@ -3,19 +3,28 @@
 A PostgreSQL dashboard for the [macros](https://github.com/kylegwinnup/macros)
 editor, written in Steel — a magit-style porcelain for `psql`.
 
-One read-only, foldable dashboard shows the database at a glance: every schema
-with its relations (tables, views, matviews), estimated row counts, on-disk
-sizes, and live backend activity. `TAB` drills into a schema, then into a table
-(columns, indexes, constraints, stats, size breakdown). `s` opens a half-window
+One read-only, foldable dashboard shows the database at a glance: connection
+and cache health, a list of things worth a look (bloat, dead rows, unused
+indexes, blocked or long-running sessions), live activity, and every schema's
+relations with size bars. `RET` drills into a schema, then into a table
+(sizes, stats, columns with planner statistics, indexes, constraints,
+foreign keys in both directions), and `q` goes back. `s` opens a half-window
 **sql-mode** query pane — write SQL with real tree-sitter highlighting, `C-c
-C-c` runs it asynchronously, and the results (psql's aligned output plus
-`\timing`) land in a results buffer.
+C-c` runs it asynchronously, and the results open as a grid.
 
 The Rust core knows nothing about Postgres — the package sits entirely on the
 same editor primitives magit and macros-k8s use: `call-process-full` (catalog
 queries), `lib-async` (cancellable async user queries), `lib-section` (foldable
 sections), `render-buffer`, `split-window-below` + `set-major-mode` (the query
 pane), and `lib-transient` (the `?` popup).
+
+![The dashboard: health header, Attention, TPS trend, activity, and schemas with size bars](screenshots/dashboard.png)
+
+| Table view | Query results as a grid |
+| --- | --- |
+| ![A table's sizes, stats, columns, indexes, constraints and incoming foreign keys](screenshots/table.png) | ![The SQL query pane with its result open as a grid](screenshots/query.png) |
+
+The screenshots use a demo database with made-up data.
 
 ## Requirements
 
@@ -163,7 +172,9 @@ All of a view's catalog queries run over one psql connection.
   Long definitions wrap under their column. Fold state is per table.
 - `v` on a table row (or in a table buffer) previews its first
   `psql-preview-rows` rows as a grid.
-- `^` goes back up a level (table → schema → dashboard).
+- `q` closes the buffer and returns to the one you opened it from, so
+  `RET` … `q` works like back navigation, including through foreign keys.
+- `^` goes up a level (table → schema → dashboard).
 
 ## Keys
 
@@ -182,7 +193,7 @@ In the dashboard / schema / table buffers (`psql-mode`):
 | `Y`           | copy the qualified name at point (fallback: the line)      |
 | `?`           | actions popup for the thing at point                       |
 | `j` `k` `n` `p` / arrows | move by line (evil/helix motion works too)      |
-| `q`           | close the buffer                                           |
+| `q`           | close the buffer and go back to where `RET` came from      |
 
 In the results / error buffers (`psql-result-mode`): `yy` copies the current
 line, `Y` the whole buffer, `q` closes (vim/helix yank can't reach these
