@@ -64,6 +64,20 @@
   (let ((v (get-option "psql-url")))
     (if (string? v) v "")))
 
+;; The URL can be a secret reference instead of a string:
+;;   (set-option "psql-url" (secret-get "prod-read-only" ""))
+;; `get-option` reads it as #f until authinfo.gpg is unlocked, so every command
+;; that talks to the server runs through here first: `option-ensure` prompts for
+;; the passphrase, then for the URL itself if there's no entry yet (offering to
+;; save it). A plain or unset option runs `k` immediately.
+(define (psql--with-url k)
+  (option-ensure "psql-url" k
+                 'on-cancel (lambda (_) (message "psql: no connection URL — cancelled"))))
+;; Synchronous callers (org-babel) can't prompt: #t while a referenced URL is
+;; still locked away.
+(define (psql--url-pending?)
+  (and (option-secret-ref "psql-url") (not (get-option "psql-url"))))
+
 ;; ── faces ─────────────────────────────────────────────────────────────────────
 ;; User-overridable: redefine any of these in init.scm (re-apply after a
 ;; load-theme, which wipes the palette).
@@ -582,29 +596,36 @@
               (goto-line line)))))))
 
 ;; ── entry / navigation commands ───────────────────────────────────────────────
-(define-command (psql-dashboard) (psql--render-dashboard))
+(define-command (psql-dashboard) (psql--with-url psql--render-dashboard))
 
 ;; Refresh whatever psql buffer we're in.
 (define-command (psql-refresh)
   (let ((v (psql--view (current-buffer))))
-    (cond ((not v) (message "psql: not a psql buffer"))
-          ((equal? (car v) "dashboard") (psql--render-dashboard))
-          ((equal? (car v) "schema")    (psql--render-schema (nth v 1)))
-          ((equal? (car v) "table")     (psql--render-table (nth v 1) (nth v 2))))))
+    (if (not v)
+        (message "psql: not a psql buffer")
+        (psql--with-url
+          (lambda ()
+            (cond ((equal? (car v) "dashboard") (psql--render-dashboard))
+                  ((equal? (car v) "schema")    (psql--render-schema (nth v 1)))
+                  ((equal? (car v) "table")     (psql--render-table (nth v 1) (nth v 2)))))))))
 
 ;; RET / g: drill into the thing at point (schema heading → schema buffer,
 ;; table row → table buffer). TAB folds instead — magit muscle memory.
 (define-command (psql-visit)
   (let ((e (psql--at)))
-    (cond ((not e) (message "psql: nothing to open here"))
-          ((equal? (nth e 1) "schema") (psql--render-schema (nth e 2)))
-          ((equal? (nth e 1) "table")  (psql--render-table (nth e 2) (nth e 3))))))
+    (if (not e)
+        (message "psql: nothing to open here")
+        (psql--with-url
+          (lambda ()
+            (cond ((equal? (nth e 1) "schema") (psql--render-schema (nth e 2)))
+                  ((equal? (nth e 1) "table")  (psql--render-table (nth e 2) (nth e 3)))))))))
 
 ;; ^: go up a level (table → its schema, schema → dashboard).
 (define-command (psql-up)
   (let ((v (psql--view (current-buffer))))
-    (cond ((and v (equal? (car v) "table"))  (psql--render-schema (nth v 1)))
-          ((and v (equal? (car v) "schema")) (psql--render-dashboard))
+    (cond ((and v (equal? (car v) "table"))
+           (psql--with-url (lambda () (psql--render-schema (nth v 1)))))
+          ((and v (equal? (car v) "schema")) (psql--with-url psql--render-dashboard))
           (else (message "psql: already at the top")))))
 
 (define-command (psql-toggle-fold) (section-toggle-at-point))
@@ -701,6 +722,7 @@
      ((async-lane-live? "psql")
       (message "psql: a query is already running — C-g cancels it"))
      (else
+      (psql--with-url (lambda ()
       (let ((file (psql--query-file))
             (status (psql--status-file))
             (u (psql--url)))
@@ -724,7 +746,7 @@
                       "; } | head -c " (number->string (psql--max-output))
                       "; exit \"$(cat " (psql--sh-quote status) ")\""))
           'psql--run-output 'psql--run-exit)
-        (message "psql: running… (C-g in the query buffer cancels)"))))))
+        (message "psql: running… (C-g in the query buffer cancels)"))))))))
 
 ;; Accumulate as a reversed LIST and join once on exit — appending each line to
 ;; one growing string is quadratic and crawls on megabyte outputs. Past the row
@@ -888,6 +910,10 @@
 (define psql--babel-max-bytes 1000000)
 
 (define (psql--babel-run body)
+  (if (psql--url-pending?)
+      "psql-url is in authinfo.gpg, which is locked — run M-x psql-dashboard (or secrets-unlock) first"
+      (psql--babel-run-now body)))
+(define (psql--babel-run-now body)
   (let* ((u (psql--url))
          (r (call-process-full "/bin/sh"
               (list "-c" (string-append
@@ -1001,14 +1027,18 @@
         (psql--catalog-build! rows)
         (psql--st! 'cat-state "failed"))))
 (define (psql--catalog-ensure!)
-  (when (equal? (psql--st 'cat-state) "") (psql--catalog-refresh!)))
+  ;; a still-locked URL would hit the PG* defaults and cache "failed"
+  (when (and (equal? (psql--st 'cat-state) "") (not (psql--url-pending?)))
+    (psql--catalog-refresh!)))
 
 (define-command (psql-catalog-refresh)
-  (psql--catalog-refresh!)
-  (message (if (equal? (psql--st 'cat-state) "ok")
-               (string-append "psql: catalog cached ("
-                              (number->string (length (psql--st 'cat-tables))) " relations)")
-               "psql: catalog fetch failed — check psql-url")))
+  (psql--with-url
+    (lambda ()
+      (psql--catalog-refresh!)
+      (message (if (equal? (psql--st 'cat-state) "ok")
+                   (string-append "psql: catalog cached ("
+                                  (number->string (length (psql--st 'cat-tables))) " relations)")
+                   "psql: catalog fetch failed — check psql-url")))))
 
 ;; Only complete in SQL buffers: the query pane, or any real .sql file.
 (define (psql--sql-buffer?)

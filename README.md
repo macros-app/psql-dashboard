@@ -55,6 +55,16 @@ environment needs no option at all. Change it at runtime with `U` in any
 dashboard buffer or `M-x psql-set-url`. Passwords are redacted (`user:***@`)
 everywhere the URL is displayed.
 
+To keep the URL out of `init.scm`, point the option at an `authinfo.gpg` entry:
+
+```scheme
+(set-option "psql-url" (secret-get "prod-read-only" ""))
+```
+
+The first command that needs the server asks for the authinfo passphrase, then
+— if there's no `prod-read-only` entry yet — for the URL itself, and offers to
+save it.
+
 The psql executable is the `psql-command` option (default `"psql"`). The GUI
 editor does **not** inherit your shell PATH, so on a typical macOS install
 point it at the binary directly:
