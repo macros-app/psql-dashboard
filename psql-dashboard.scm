@@ -14,21 +14,25 @@
 ;;;   * lib-transient — the `?` popup
 ;;;
 ;;; Buffers and drill-down:
-;;;   *psql-dashboard*        all schemas, each a foldable section (TAB folds)
-;;;                           listing its tables (kind, ~rows, size), plus live
-;;;                           activity.
+;;;   *psql-dashboard*        health header (connections, cache hit, TPS
+;;;                           sparkline), Attention (things worth a look),
+;;;                           Trends, Activity, then each schema's biggest
+;;;                           relations with size bars. `a` auto-refreshes.
 ;;;                           RET / g on a schema heading → the schema buffer;
 ;;;                           RET / g on a table row      → the table buffer.
 ;;;   *psql-schema:S*         schema info + its tables with size breakdown
 ;;;                           (total / table / indexes). RET / g drills into a
 ;;;                           table; ^ goes back up to the dashboard.
-;;;   *psql-table:S.T*        columns, indexes, constraints, stats, sizes (and
-;;;                           the definition, for views). ^ goes up to the schema.
+;;;   *psql-table:S.T*        size bars, stats, columns (keys + planner stats),
+;;;                           indexes, constraints (RET follows a foreign key),
+;;;                           referenced-by (and the definition, for views).
+;;;                           ^ goes up to the schema; v previews rows.
 ;;;   *psql-query*            an editable sql-mode buffer in a half-height pane
 ;;;                           (`s` from any dashboard buffer, or M-x psql-query).
 ;;;                           C-c C-c runs the buffer's SQL asynchronously;
 ;;;                           C-g cancels a running query; C-c C-k closes it.
-;;;   *psql-results*          the query output (psql's aligned table + timing).
+;;;   psql-result.csv         the query output as a grid (errors / no rows →
+;;;                           results.org instead).
 ;;;
 ;;; Conventions (matching macros-k8s / macros-jj):
 ;;;   * public commands are `psql-…`, private helpers `psql--…`
@@ -95,6 +99,7 @@
 (set-face "psql-warn"    "#e6db74")   ; idle in transaction, dead tuples
 (set-face "psql-err"     "#f92672")   ; errors
 (set-face "psql-dim"     "#888888")   ; column headers, hints, empty notes
+(set-face "psql-bar"     "#ae81ff")   ; inline bars and sparklines
 
 ;; ── state ─────────────────────────────────────────────────────────────────────
 (define psql-state
@@ -110,6 +115,12 @@
    'cat-schemas '() ; (schema …)
    'cat-tables  '() ; ((schema table) …)
    'cat-cols    '() ; "table" / "schema.table" -> (column …)
+   ;; dashboard trends + auto-refresh
+   'samples     '() ; ((ms xacts blks-hit blks-read active) …), oldest first
+   'auto        #f  ; auto-refresh on?
+   'timer-armed #f  ; is a tick scheduled?
+   'quiet       #f  ; rendering from a tick (skip the catalog refresh)
+   'pending-msg ""  ; echo-area summary shown after a results file opens
    ))
 (define (psql--st key) (hash-try-get psql-state key))
 (define (psql--st! key val) (set! psql-state (hash-insert psql-state key val)))
@@ -281,7 +292,183 @@
   (psql--st! 'views (psql--alist-set (psql--st 'views) buf v)))
 (define (psql--view buf) (alist-ref (psql--st 'views) buf))
 
-;; ── catalog queries ───────────────────────────────────────────────────────────
+;; ── batched queries ───────────────────────────────────────────────────────────
+;; A view needs several catalog queries, and every psql run is a fresh
+;; connection (a TLS handshake, for a remote server). So a view's queries go out
+;; as ONE psql process — `-c q1 -c SEP -c q2 -c SEP …` — and the output is split
+;; back apart on the separator rows. psql keeps going past a failing -c (exit
+;; 0, the error on stderr), so an optional query (pg_stat_statements on a
+;; server without it) just comes back empty.
+(define psql--sep "@@PSQL-SEP@@")
+(define (psql--batch-args specs)
+  (let loop ((ss specs) (acc '()))
+    (if (null? ss)
+        (reverse acc)
+        (loop (cdr ss)
+              (cons (string-append "select '" psql--sep "'")
+                    (cons "-c" (cons (car (car ss)) (cons "-c" acc))))))))
+(define (psql--split-batch lines)
+  (let loop ((ls lines) (cur '()) (groups '()))
+    (cond ((null? ls) (reverse (if (null? cur) groups (cons (reverse cur) groups))))
+          ((equal? (car ls) psql--sep) (loop (cdr ls) '() (cons (reverse cur) groups)))
+          (else (loop (cdr ls) (cons (car ls) cur) groups)))))
+
+;; `specs` = ((sql ncols) …) → (rows-per-query error-lines), or #f after
+;; surfacing a failure to run psql / connect at all.
+(define (psql--batch specs)
+  (let ((r (psql--run-full (append (psql--conn)
+                                   (list "-X" "-q" "-A" "-t" "-P" "pager=off")
+                                   (psql--batch-args specs)))))
+    (if (not (equal? (car r) "0"))
+        (begin (psql--error (car r) (nth r 2)) #f)
+        (let ((groups (psql--split-batch (psql--lines (nth r 1)))))
+          (list (let loop ((ss specs) (gs groups) (acc '()))
+                  (if (null? ss)
+                      (reverse acc)
+                      (loop (cdr ss) (if (null? gs) '() (cdr gs))
+                            (cons (map (lambda (ln) (psql--fields-n ln (cadr (car ss))))
+                                       (if (null? gs) '() (car gs)))
+                                  acc))))
+                (filter (lambda (l) (starts-with? l "ERROR:"))
+                        (split-many (nth r 2) "\n")))))))
+
+;; ── display helpers ───────────────────────────────────────────────────────────
+(define (psql--2d n) (if (< n 10) (string-append "0" (number->string n)) (number->string n)))
+;; Seconds → "45s" · "12m03s" · "3h07m" · "2d4h"; "" for unknown (< 0).
+(define (psql--dur secs)
+  (cond ((< secs 0) "")
+        ((< secs 60) (string-append (number->string secs) "s"))
+        ((< secs 3600) (string-append (number->string (quotient secs 60)) "m"
+                                      (psql--2d (remainder secs 60)) "s"))
+        ((< secs 86400) (string-append (number->string (quotient secs 3600)) "h"
+                                       (psql--2d (quotient (remainder secs 3600) 60)) "m"))
+        (else (string-append (number->string (quotient secs 86400)) "d"
+                             (number->string (quotient (remainder secs 86400) 3600)) "h"))))
+;; Milliseconds → "850ms" or a duration.
+(define (psql--ms ms)
+  (if (< ms 1000) (string-append (number->string ms) "ms") (psql--dur (quotient ms 1000))))
+;; a / (a + b) in permille, or -1 when there's nothing to divide.
+(define (psql--ratio-pm a b)
+  (if (> (+ a b) 0) (quotient (* a 1000) (+ a b)) -1))
+;; Permille → "99.8%".
+(define (psql--pct pm)
+  (if (< pm 0)
+      "-"
+      (string-append (number->string (quotient pm 10)) "." (number->string (remainder pm 10)) "%")))
+;; A cache-hit permille's face: healthy ≥ 99%, worrying < 95%.
+(define (psql--hit-face pm)
+  (cond ((< pm 0) "psql-dim") ((>= pm 990) "psql-ok") ((>= pm 950) "psql-warn") (else "psql-err")))
+;; An inline bar (lib-plot glyphs, ⅛-cell resolution) padded to `width` cells,
+;; so the columns after it stay aligned.
+(define (psql--bar v mx width)
+  (pad-right (if (and (> mx 0) (> v 0)) (textplot-hbar v mx width) "") width))
+(define (psql--max-of nums) (if (null? nums) 0 (apply max nums)))
+(define (psql--dash-rows) (psql--option-num "psql-dashboard-rows" 15))
+
+;; ── aligned rows ──────────────────────────────────────────────────────────────
+;; A cell is a string or (text face): faced cells become sub-line accents (bars,
+;; markers) without coloring the whole line. The LAST cell is the free-text one:
+;; past psql--wrap-width it wraps onto continuation lines indented under its
+;; column, instead of soft-wrapping back to column 0.
+(define psql--wrap-width 100)
+(define (psql--cell-text c) (if (string? c) c (car c)))
+(define (psql--cell-face c) (if (string? c) #f (cadr c)))
+
+;; Greedy word wrap → lines (a single word longer than `w` stays whole).
+(define (psql--wrap s w)
+  (if (<= (string-length s) w)
+      (list s)
+      (let loop ((ws (split-many s " ")) (cur "") (acc '()))
+        (cond ((null? ws) (reverse (if (equal? cur "") acc (cons cur acc))))
+              ((equal? cur "") (loop (cdr ws) (car ws) acc))
+              ((> (+ (string-length cur) 1 (string-length (car ws))) w)
+               (loop ws "" (cons cur acc)))
+              (else (loop (cdr ws) (string-append cur " " (car ws)) acc))))))
+
+(define (psql--emit-row cells ws line-face)
+  (let loop ((cs cells) (ws ws) (text "    ") (accents '()))
+    (if (null? (cdr cs))
+        (let* ((col (string-length text))
+               (parts (psql--wrap (psql--cell-text (car cs)) psql--wrap-width))
+               (start (utf8-length text))
+               (first (string-append text (car parts)))
+               (accents (if (psql--cell-face (car cs))
+                            (cons (list start (utf8-length first) (psql--cell-face (car cs))) accents)
+                            accents))
+               (b (section-point-byte)))
+          (section-line first line-face)
+          (for-each (lambda (a) (section-accent (+ b (car a)) (+ b (cadr a)) (nth a 2))) accents)
+          (for-each (lambda (p) (section-line (string-append (string-repeat " " col) p) line-face))
+                    (cdr parts)))
+        (let* ((t (pad-right (psql--cell-text (car cs)) (car ws)))
+               (start (utf8-length text)))
+          (loop (cdr cs) (cdr ws) (string-append text t "  ")
+                (if (psql--cell-face (car cs))
+                    (cons (list start (+ start (utf8-length t)) (psql--cell-face (car cs))) accents)
+                    accents))))))
+
+;; A column-aligned block: header row (dim) + one row per record. `cells-of`
+;; maps a record to its display cells; `record-of` (or #f) is called per record
+;; to register the row in the line map; `face-of` (or #f) picks a row face.
+(define (psql--emit-rows header records cells-of record-of face-of)
+  (let* ((cells (map cells-of records))
+         (ws (psql--widths (map (lambda (r) (map psql--cell-text r)) (cons header cells)))))
+    (psql--emit-row header ws "psql-dim")
+    (let loop ((rs records) (cs cells))
+      (when (not (null? rs))
+        (when record-of (record-of (car rs)))
+        (psql--emit-row (car cs) ws (if face-of (face-of (car rs)) #f))
+        (loop (cdr rs) (cdr cs))))))
+
+;; One line from (text face) segments, each faced segment an accent.
+(define (psql--emit-segs segs line-face)
+  (let ((b (section-point-byte)))
+    (let loop ((ss segs) (off 0) (text ""))
+      (if (null? ss)
+          (section-line text line-face)
+          (let* ((t (car (car ss))) (f (cadr (car ss))) (n (utf8-length t)))
+            (when f (section-accent (+ b off) (+ b off n) f))
+            (loop (cdr ss) (+ off n) (string-append text t)))))))
+;; "    key         value" with a dim key.
+(define (psql--kv key segs)
+  (psql--emit-segs (cons (list (string-append "    " (pad-right key 12)) "psql-dim") segs) #f))
+
+(define (psql--emit-hint text)
+  (section-line (string-append "  " text) "psql-dim")
+  (section-line "" #f))
+
+;; Lib-plot rows, indented to sit under a section heading.
+(define (psql--emit-plot p)
+  (for-each
+   (lambda (row)
+     (let ((b (+ (section-point-byte) 4)))
+       (section-line (string-append "    " (plot-row-text row)))
+       (for-each (lambda (s) (section-accent (+ b (car s)) (+ b (cadr s)) (nth s 2)))
+                 (plot-row-spans row))))
+   p))
+
+;; ── dashboard queries ─────────────────────────────────────────────────────────
+(define psql--meta-sql
+  (string-append
+   "select current_database(), current_user, current_setting('server_version'),"
+   " pg_database_size(current_database()), pg_is_in_recovery(),"
+   " current_setting('max_connections'),"
+   " coalesce(extract(epoch from now() - pg_postmaster_start_time())::bigint, -1)"))
+;; Cumulative counters — rates come from the difference between two refreshes.
+(define psql--dbstats-sql
+  (string-append
+   "select (extract(epoch from clock_timestamp()) * 1000)::bigint,"
+   " d.xact_commit + d.xact_rollback, d.blks_hit, d.blks_read, d.deadlocks,"
+   " d.temp_bytes, age(db.datfrozenxid)"
+   " from pg_stat_database d join pg_database db on db.oid = d.datid"
+   " where d.datname = current_database()"))
+(define psql--conns-sql
+  (string-append
+   "select count(*), count(*) filter (where state = 'active'),"
+   " count(*) filter (where state like 'idle in transaction%'),"
+   " count(*) filter (where wait_event_type = 'Lock')"
+   " from pg_stat_activity where datname = current_database()"
+   " and backend_type = 'client backend'"))
 ;; All relations in user schemas. relname LAST (the free-text-ish column).
 (define psql--tables-sql
   (string-append
@@ -296,178 +483,399 @@
    "select pg_get_userbyid(n.nspowner), n.nspname from pg_namespace n"
    " where left(n.nspname,3) <> 'pg_' and n.nspname <> 'information_schema'"
    " order by n.nspname"))
+;; Non-idle client sessions, longest-running first.
 (define psql--activity-sql
   (string-append
    "select a.pid, coalesce(a.usename,''), coalesce(a.state,''),"
-   " coalesce(date_trunc('second', now() - a.query_start)::text, ''),"
-   " left(regexp_replace(coalesce(a.query,''), '\\s+', ' ', 'g'), 90)"
+   " coalesce(a.wait_event_type || ':' || a.wait_event, ''),"
+   " coalesce(extract(epoch from now() - coalesce(a.query_start, a.backend_start))::bigint, -1),"
+   " array_to_string(pg_blocking_pids(a.pid), ','),"
+   " left(regexp_replace(coalesce(a.query,''), '\\s+', ' ', 'g'), 200)"
    " from pg_stat_activity a"
    " where a.datname = current_database() and a.pid <> pg_backend_pid()"
-   " order by a.query_start desc nulls last"))
+   " and a.backend_type = 'client backend' and coalesce(a.state,'') <> 'idle'"
+   " order by a.query_start nulls last"))
+;; Things worth a look, as (severity check schema relation detail). Severity is
+;; err / warn / info; `ord` puts live problems (blocking, long queries) first.
+(define psql--attention-sql
+  (string-append
+   "select sev, kind, sch, rel, detail from ("
+   ;; sessions
+   " select 'err' sev, 'blocked' kind, '' sch, '' rel,"
+   "  'pid ' || pid || ' (' || coalesce(usename,'') || ') waiting on pid '"
+   "  || array_to_string(pg_blocking_pids(pid), ',') detail, 0 ord"
+   "  from pg_stat_activity where datname = current_database()"
+   "  and cardinality(pg_blocking_pids(pid)) > 0"
+   " union all"
+   " select 'err', 'long query', '', '',"
+   "  'pid ' || pid || ' (' || coalesce(usename,'') || ') running for '"
+   "  || date_trunc('second', now() - query_start)::text, 1"
+   "  from pg_stat_activity where datname = current_database() and state = 'active'"
+   "  and pid <> pg_backend_pid() and now() - query_start > interval '5 minutes'"
+   " union all"
+   " select 'err', 'idle in xact', '', '',"
+   "  'pid ' || pid || ' (' || coalesce(usename,'') || ') idle in transaction for '"
+   "  || date_trunc('second', now() - state_change)::text || ' — holds locks, blocks vacuum', 1"
+   "  from pg_stat_activity where datname = current_database()"
+   "  and state like 'idle in transaction%' and now() - state_change > interval '1 minute'"
+   " union all"
+   " select 'warn', 'xid age', '', '',"
+   "  'transaction ID age ' || age(datfrozenxid)::text || ' (wraparound at ~2.1B)', 1"
+   "  from pg_database where datname = current_database() and age(datfrozenxid) > 500000000"
+   ;; tables
+   " union all"
+   " select 'warn', 'dead tuples', schemaname, relname,"
+   "  n_dead_tup::text || ' dead rows (' || (n_dead_tup * 100 / greatest(n_live_tup + n_dead_tup, 1))::text"
+   "  || '%) · last vacuum ' || coalesce(date_trunc('second', greatest(last_vacuum, last_autovacuum))::text, 'never'), 2"
+   "  from pg_stat_user_tables where n_dead_tup > 1000 and n_dead_tup * 5 > n_live_tup"
+   " union all"
+   " select 'warn', 'empty but big', schemaname, relname,"
+   "  pg_size_pretty(pg_table_size(relid)) || ' on disk with ~0 live rows — bloat (VACUUM FULL)', 3"
+   "  from pg_stat_user_tables where n_live_tup = 0 and pg_table_size(relid) > 10485760"
+   " union all"
+   " select 'info', 'seq scans', schemaname, relname,"
+   "  seq_scan::text || ' seq scans reading ~' || (seq_tup_read / greatest(seq_scan, 1))::text"
+   "  || ' rows each vs ' || coalesce(idx_scan, 0)::text || ' index scans — missing index?', 4"
+   "  from pg_stat_user_tables where seq_scan > 100 and n_live_tup > 10000"
+   "  and seq_tup_read / greatest(seq_scan, 1) > 10000 and seq_scan > coalesce(idx_scan, 0)"
+   " union all"
+   " select 'info', 'unused index', s.schemaname, s.relname,"
+   "  s.indexrelname || ' · ' || pg_size_pretty(pg_relation_size(s.indexrelid)) || ' · 0 scans', 5"
+   "  from pg_stat_user_indexes s join pg_index i on i.indexrelid = s.indexrelid"
+   "  where s.idx_scan = 0 and not i.indisunique and not i.indisprimary"
+   "  and pg_relation_size(s.indexrelid) > 1048576"
+   ;; never-analyzed: listed when they're big enough to matter; the (usually
+   ;; many) small ones — autovacuum skips tables that barely change — as one row
+   " union all"
+   " select 'info', 'not analyzed', n.nspname, c.relname,"
+   "  'no planner statistics — row estimates unknown (ANALYZE)', 6"
+   "  from pg_class c join pg_namespace n on n.oid = c.relnamespace"
+   "  where c.relkind in ('r','p','m') and c.reltuples < 0"
+   "  and pg_total_relation_size(c.oid) > 1048576"
+   "  and left(n.nspname,3) <> 'pg_' and n.nspname <> 'information_schema'"
+   " union all"
+   " select 'info', 'not analyzed', '', '',"
+   "  count(*)::text || ' small tables (< 1 MB) never analyzed — their ~ROWS show ?', 7"
+   "  from pg_class c join pg_namespace n on n.oid = c.relnamespace"
+   "  where c.relkind in ('r','p','m') and c.reltuples < 0"
+   "  and pg_total_relation_size(c.oid) <= 1048576"
+   "  and left(n.nspname,3) <> 'pg_' and n.nspname <> 'information_schema'"
+   "  having count(*) > 0"
+   ") x order by ord, sch, rel, detail"))
+;; Top statements by total time — only when pg_stat_statements is installed
+;; (otherwise this query errors and the section is skipped).
+(define psql--pgss-sql
+  (string-append
+   "select s.calls, round(s.total_exec_time)::bigint, round(s.mean_exec_time)::bigint, s.rows,"
+   " left(regexp_replace(s.query, '\\s+', ' ', 'g'), 200)"
+   " from pg_stat_statements s"
+   " where s.dbid = (select oid from pg_database where datname = current_database())"
+   " order by s.total_exec_time desc limit 10"))
+
+;; ── samples (trends) ──────────────────────────────────────────────────────────
+;; Each dashboard render appends (ms xacts blks-hit blks-read active) from the
+;; cumulative counters; rates are the differences between neighbours. A stats
+;; reset (counters going backwards) just drops that interval.
+(define psql--max-samples 60)
+(define (psql--sample! s)
+  (let ((xs (append (psql--st 'samples) (list s))))
+    (psql--st! 'samples (if (> (length xs) psql--max-samples) (cdr xs) xs))))
+;; → ((tps hit-permille active) …), oldest first.
+(define (psql--rates)
+  (let loop ((xs (psql--st 'samples)) (acc '()))
+    (if (or (null? xs) (null? (cdr xs)))
+        (reverse acc)
+        (let* ((a (car xs)) (b (cadr xs))
+               (dms (- (car b) (car a)))
+               (dx (- (nth b 1) (nth a 1))))
+          (loop (cdr xs)
+                (if (and (> dms 0) (>= dx 0))
+                    (cons (list (quotient (* dx 1000) dms)
+                                (psql--ratio-pm (- (nth b 2) (nth a 2)) (- (nth b 3) (nth a 3)))
+                                (nth b 4))
+                          acc)
+                    acc))))))
 
 ;; ── dashboard rendering ───────────────────────────────────────────────────────
-(define (psql--activity-face state)
-  (cond ((equal? state "active") "psql-ok")
-        ((string-contains? state "idle in transaction") "psql-warn")
-        (else "psql-dim")))
+(define (psql--activity-face a)
+  (let ((state (psql--nth-or a 2 "")))
+    (cond ((not (equal? (psql--nth-or a 5 "") "")) "psql-err")   ; blocked
+          ((string-contains? state "idle in transaction") "psql-warn")
+          ((equal? state "active") "psql-ok")
+          (else "psql-dim"))))
+(define (psql--sev-face sev)
+  (cond ((equal? sev "err") "psql-err") ((equal? sev "warn") "psql-warn") (else #f)))
 
-(define (psql--emit-hint text)
-  (section-line (string-append "  " text) "psql-dim")
+(define (psql--emit-dash-header m db c)
+  (let* ((maxc (psql--num (psql--nth-or m 5 "0")))
+         (total (psql--num (psql--nth-or c 0 "0")))
+         (hit (if (null? db) -1 (psql--ratio-pm (psql--num (nth db 2)) (psql--num (nth db 3)))))
+         (rates (psql--rates))
+         (tps (map car rates)))
+    (section-line (string-append "Database: " (psql--nth-or m 0 "?")
+                                 "   PostgreSQL " (psql--nth-or m 2 "?")
+                                 (if (equal? (psql--nth-or m 4 "f") "t") "   [replica]" "")
+                                 "   " (psql--display-url)
+                                 (if (psql--st 'auto)
+                                     (string-append "   [auto-refresh "
+                                                    (number->string (quotient (psql--auto-ms) 1000)) "s]")
+                                     ""))
+                  "psql-header")
+    (psql--emit-segs
+     (list (list (string-append "Size: " (psql--human (psql--num (psql--nth-or m 3 "0")))
+                                "   User: " (psql--nth-or m 1 "?")
+                                "   Up: " (psql--dur (psql--num (psql--nth-or m 6 "-1")))
+                                "   Connections: " (number->string total) "/" (number->string maxc) " ")
+                 #f)
+           (list (psql--bar total maxc 10) "psql-bar")
+           (list (string-append " " (psql--nth-or c 1 "?") " active · "
+                                (psql--nth-or c 2 "?") " idle in xact · "
+                                (psql--nth-or c 3 "?") " waiting on locks")
+                 #f))
+     #f)
+    (psql--emit-segs
+     (append
+      (list (list "Cache hit: " #f)
+            (list (psql--pct hit) (psql--hit-face hit))
+            (list " " #f)
+            (list (psql--bar (max hit 0) 1000 10) "psql-bar")
+            (list "   TPS: " #f))
+      (cond ((null? tps)
+             (list (list "(r refreshes add samples · a auto-refreshes)" "psql-dim")))
+            ((null? (cdr tps))
+             (list (list (string-append (number->string (car tps)) "/s") #f)))
+            (else
+             (list (list (textplot-sparkline tps 0 (max 1 (psql--max-of tps))) "psql-bar")
+                   (list (string-append " " (number->string (car (reverse tps))) "/s") #f))))
+      (if (null? db)
+          '()
+          (list (list (string-append "   Deadlocks: " (nth db 4)
+                                     "   Temp: " (psql--human (psql--num (nth db 5))))
+                      #f))))
+     #f)
+    (psql--emit-hint (string-append "r refresh · a auto · RET/g open · v preview rows · TAB fold · "
+                                    "s query · U url · Y copy · ? menu · q quit"))))
+
+;; "schema.rel", or "-" for a database-wide finding.
+(define (psql--qual s t) (if (equal? t "") "-" (string-append s "." t)))
+
+(define (psql--emit-attention rows)
+  (section-open "psql/attention"
+                (string-append "Attention (" (number->string (length rows)) ")")
+                "psql-section")
+  (if (null? rows)
+      (section-line "    ✓ nothing to flag" "psql-ok")
+      (psql--emit-rows (list "" "CHECK" "RELATION" "DETAIL")
+                       rows
+                       (lambda (r)
+                         (let ((sev (nth r 0)))
+                           (list (list (if (equal? sev "info") "·" "▲")
+                                       (if (psql--sev-face sev) (psql--sev-face sev) "psql-dim"))
+                                 (nth r 1) (psql--qual (nth r 2) (nth r 3)) (nth r 4))))
+                       (lambda (r) (unless (equal? (nth r 3) "")
+                                     (psql--record "table" (nth r 2) (nth r 3))))
+                       (lambda (r) (if (equal? (nth r 0) "err") "psql-err" #f))))
+  (section-close "psql/attention")
   (section-line "" #f))
 
-;; A column-aligned block: header row (dim) + one row per record. `cells-of`
-;; maps a record to its display cells; `record-of` (or #f) is called per record
-;; to register the row in the line map; `face-of` (or #f) picks a row face.
-(define (psql--emit-rows header records cells-of record-of face-of)
-  (let* ((cells (map cells-of records))
-         (ws (psql--widths (cons header cells))))
-    (section-line (string-append "    " (psql--fmt header ws)) "psql-dim")
-    (let loop ((rs records) (cs cells))
-      (when (not (null? rs))
-        (when record-of (record-of (car rs)))
-        (section-line (string-append "    " (psql--fmt (car cs) ws))
-                      (if face-of (face-of (car rs)) #f))
-        (loop (cdr rs) (cdr cs))))))
-
-;; One schema's foldable section in the dashboard. `rows` are parsed records
-;; (kind tuples bytes name), already size-sorted by the SQL.
-(define (psql--emit-schema s owner rows)
-  (let ((total (psql--sum (map (lambda (r) (nth r 2)) rows))))
-    (psql--record "schema" s "")
-    (section-open (string-append "psql/" s)
-                  (string-append s "  (" (number->string (length rows)) " relations · "
-                                 (psql--human total) " · " owner ")")
-                  "psql-section")
-    (if (null? rows)
-        (section-line "    (no relations)" "psql-dim")
-        (psql--emit-rows
-         (list "NAME" "TYPE" "~ROWS" "SIZE")
-         rows
-         (lambda (r) (list (nth r 3) (psql--kind (nth r 0))
-                           (if (psql--sizeless? (nth r 0)) "-" (psql--rows-h (nth r 1)))
-                           (if (psql--sizeless? (nth r 0)) "-" (psql--human (nth r 2)))))
-         (lambda (r) (psql--record "table" s (nth r 3)))
-         #f))
-    (section-close (string-append "psql/" s))
-    (section-line "" #f)))
+;; TPS over the samples so far (appears from the third refresh on).
+(define (psql--emit-trends)
+  (let ((tps (map car (psql--rates))))
+    (when (>= (length tps) 3)
+      (section-open "psql/trends" "Trends" "psql-section")
+      (psql--emit-plot
+       (plot-lines (list (list "TPS" tps))
+                   'width 60 'height 6 'y-min 0 'legend #f
+                   'title (string-append "transactions/s · last " (number->string (length tps))
+                                         " intervals")))
+      (section-close "psql/trends")
+      (section-line "" #f))))
 
 (define (psql--emit-activity act)
   (section-open 'psql-activity
-                (string-append "Activity (" (number->string (length act)) ")")
+                (string-append "Activity (" (number->string (length act)) " non-idle)")
                 "psql-section")
   (if (null? act)
-      (section-line "    (no other backends)" "psql-dim")
-      (psql--emit-rows (list "PID" "USER" "STATE" "TIME" "QUERY")
+      (section-line "    (no other non-idle sessions)" "psql-dim")
+      (psql--emit-rows (list "PID" "USER" "STATE" "WAIT" "TIME" "BLOCKED BY" "QUERY")
                        act
-                       (lambda (a) a)
+                       (lambda (a) (list (nth a 0) (nth a 1) (nth a 2) (nth a 3)
+                                         (psql--dur (psql--num (nth a 4))) (nth a 5) (nth a 6)))
                        #f
-                       (lambda (a) (psql--activity-face (psql--nth-or a 2 "")))))
+                       psql--activity-face))
   (section-close 'psql-activity)
   (section-line "" #f))
 
+(define (psql--emit-top-queries rows)
+  (unless (null? rows)
+    (section-open "psql/top-queries" "Top queries (pg_stat_statements, by total time)" "psql-section")
+    (let ((mx (psql--max-of (map (lambda (r) (psql--num (nth r 1))) rows))))
+      (psql--emit-rows (list "CALLS" "TOTAL" "" "MEAN" "ROWS" "QUERY")
+                       rows
+                       (lambda (r) (list (nth r 0) (psql--ms (psql--num (nth r 1)))
+                                         (list (psql--bar (psql--num (nth r 1)) mx 10) "psql-bar")
+                                         (psql--ms (psql--num (nth r 2))) (nth r 3) (nth r 4)))
+                       #f #f))
+    (section-close "psql/top-queries")
+    (section-line "" #f)))
+
+;; One schema's foldable section: its biggest relations (psql-dashboard-rows,
+;; default 15) with a size bar, then a "… N more" line that opens the schema.
+;; `rows` are (kind tuples bytes name), already size-sorted by the SQL.
+(define (psql--emit-schema s owner rows)
+  (let* ((sizes (map (lambda (r) (nth r 2)) rows))
+         (mx (psql--max-of sizes))
+         (shown (psql--take rows (psql--dash-rows)))
+         (more (- (length rows) (length shown))))
+    (psql--record "schema" s "")
+    (section-open (string-append "psql/" s)
+                  (string-append s "  (" (number->string (length rows)) " relations · "
+                                 (psql--human (psql--sum sizes)) " · " owner ")")
+                  "psql-section")
+    (if (null? rows)
+        (section-line "    (no relations)" "psql-dim")
+        (begin
+          (psql--emit-rows
+           (list "NAME" "TYPE" "~ROWS" "SIZE" "")
+           shown
+           (lambda (r)
+             (if (psql--sizeless? (nth r 0))
+                 (list (nth r 3) (psql--kind (nth r 0)) "-" "-" "")
+                 (list (nth r 3) (psql--kind (nth r 0)) (psql--rows-h (nth r 1))
+                       (psql--human (nth r 2)) (list (psql--bar (nth r 2) mx 16) "psql-bar"))))
+           (lambda (r) (psql--record "table" s (nth r 3)))
+           #f)
+          (when (> more 0)
+            (psql--record "schema" s "")
+            (section-line (string-append "    … " (number->string more) " more — RET opens " s)
+                          "psql-dim"))))
+    (section-close (string-append "psql/" s))
+    (section-line "" #f)))
+
 (define (psql--render-dashboard)
-  (let ((meta (psql--query
-               (string-append "select current_database(), current_user,"
-                              " current_setting('server_version'),"
-                              " pg_size_pretty(pg_database_size(current_database()))") 4)))
-    (when meta   ; #f = connection/query failure, already surfaced
-      (let* ((m     (if (null? meta) (list "?" "?" "?" "?") (car meta)))
-             (conns (psql--query (string-append
-                                  "select count(*), count(*) filter (where state = 'active')"
-                                  " from pg_stat_activity where datname = current_database()") 2))
-             (tabs    (psql--query psql--tables-sql 5))
-             (schemas (psql--query psql--schemas-sql 2))
-             (act     (psql--query psql--activity-sql 5))
-             (line (if (equal? (current-buffer) "*psql-dashboard*") (buffer-line) 0)))
-        (when (and conns tabs schemas act)
-          (psql--lm-begin! "*psql-dashboard*")
-          (psql--view-set! "*psql-dashboard*" (list "dashboard"))
-          (section-begin)
-          (section-line (string-append "Database: " (psql--nth-or m 0 "?")
-                                       "   PostgreSQL " (psql--nth-or m 2 "?")
-                                       "   " (psql--display-url))
-                        "psql-header")
-          (let ((c (if (null? conns) (list "?" "?") (car conns))))
-            (section-line (string-append "Size: " (psql--nth-or m 3 "?")
-                                         "   User: " (psql--nth-or m 1 "?")
-                                         "   Connections: " (psql--nth-or c 0 "?")
-                                         " (" (psql--nth-or c 1 "?") " active)")
-                          #f))
-          (psql--emit-hint (string-append "r refresh · RET/g drill in · TAB fold · "
-                                          "s query · U url · Y copy · ? menu · q quit"))
-          (for-each
-           (lambda (srow)
-             (let* ((owner (psql--nth-or srow 0 ""))
-                    (s     (psql--nth-or srow 1 ""))
-                    (rows  (map (lambda (r) (list (psql--nth-or r 1 "")
-                                                  (psql--num (psql--nth-or r 2 "-1"))
-                                                  (psql--num (psql--nth-or r 3 "0"))
-                                                  (psql--nth-or r 4 "")))
-                                (filter (lambda (r) (equal? (psql--nth-or r 0 "") s)) tabs))))
-               (psql--emit-schema s owner rows)))
-           schemas)
-          (psql--emit-activity act)
-          (section-render "*psql-dashboard*" "psql-mode")
-          (goto-line line)
-          ;; piggy-back: refresh the SQL completion catalog while we're here
-          (psql--catalog-refresh!))))))
+  (let ((res (psql--batch (list (list psql--meta-sql 7) (list psql--dbstats-sql 7)
+                                (list psql--conns-sql 4) (list psql--tables-sql 5)
+                                (list psql--schemas-sql 2) (list psql--activity-sql 7)
+                                (list psql--attention-sql 5) (list psql--pgss-sql 5)))))
+    (when res   ; #f = couldn't run psql / connect, already surfaced
+      (let* ((qs (car res))
+             ;; pg_stat_statements missing is expected, not an error
+             (errs (filter (lambda (e) (not (string-contains? e "pg_stat_statements"))) (cadr res)))
+             (meta (nth qs 0)))
+        (if (null? meta)
+            (psql--error "1" (string-join (cadr res) "\n"))
+            (let* ((m (car meta))
+                   (db (if (null? (nth qs 1)) '() (car (nth qs 1))))
+                   (c (if (null? (nth qs 2)) (list "?" "?" "?" "?") (car (nth qs 2))))
+                   (tabs (nth qs 3))
+                   (act (nth qs 5))
+                   (line (if (equal? (current-buffer) "*psql-dashboard*") (buffer-line) 0)))
+              (unless (null? db)
+                (psql--sample! (list (psql--num (nth db 0)) (psql--num (nth db 1))
+                                     (psql--num (nth db 2)) (psql--num (nth db 3))
+                                     (psql--num (psql--nth-or c 1 "0")))))
+              (psql--lm-begin! "*psql-dashboard*")
+              (psql--view-set! "*psql-dashboard*" (list "dashboard"))
+              (section-begin)
+              (psql--emit-dash-header m db c)
+              (psql--emit-attention
+               (append (nth qs 6)
+                       (let ((hit (if (null? db) -1
+                                      (psql--ratio-pm (psql--num (nth db 2)) (psql--num (nth db 3))))))
+                         (if (and (>= hit 0) (< hit 990))
+                             (list (list "warn" "cache hit" "" ""
+                                         (string-append (psql--pct hit) " of reads served from"
+                                                        " shared buffers — working set may exceed"
+                                                        " shared_buffers")))
+                             '()))
+                       (map (lambda (e) (list "warn" "query error" "" "" e)) errs)))
+              (psql--emit-trends)
+              (psql--emit-activity act)
+              (psql--emit-top-queries (nth qs 7))
+              (for-each
+               (lambda (srow)
+                 (let* ((owner (psql--nth-or srow 0 ""))
+                        (s     (psql--nth-or srow 1 ""))
+                        (rows  (map (lambda (r) (list (psql--nth-or r 1 "")
+                                                      (psql--num (psql--nth-or r 2 "-1"))
+                                                      (psql--num (psql--nth-or r 3 "0"))
+                                                      (psql--nth-or r 4 "")))
+                                    (filter (lambda (r) (equal? (psql--nth-or r 0 "") s)) tabs))))
+                   (psql--emit-schema s owner rows)))
+               (nth qs 4))
+              (section-render "*psql-dashboard*" "psql-mode")
+              (goto-line line)
+              ;; piggy-back: refresh the SQL completion catalog — but not on
+              ;; every auto-refresh tick (it's a whole pg_attribute scan)
+              (unless (psql--st 'quiet) (psql--catalog-refresh!))))))))
 
 ;; ── schema buffer ─────────────────────────────────────────────────────────────
 (define (psql--schema-buffer s) (string-append "*psql-schema:" s "*"))
 
 (define (psql--render-schema s)
   (let* ((sq (psql--sq s))
-         (info (psql--query
-                (string-append "select pg_get_userbyid(n.nspowner),"
-                               " coalesce(obj_description(n.oid,'pg_namespace'),'')"
-                               " from pg_namespace n where n.nspname = '" sq "'") 2))
-         (tabs (psql--query
-                (string-append
-                 "select c.relkind, c.reltuples::bigint, pg_total_relation_size(c.oid),"
-                 " pg_table_size(c.oid), pg_indexes_size(c.oid), c.relname"
-                 " from pg_class c join pg_namespace n on n.oid = c.relnamespace"
-                 " where n.nspname = '" sq "' and c.relkind in ('r','p','m','v','f')"
-                 " order by pg_total_relation_size(c.oid) desc, c.relname") 6)))
-    (when (and info tabs)
-      (if (null? info)
-          (message (string-append "psql: no such schema — " s))
-          (let* ((buf   (psql--schema-buffer s))
-                 (owner (psql--nth-or (car info) 0 ""))
-                 (desc  (psql--nth-or (car info) 1 ""))
-                 (rows  (map (lambda (r) (list (psql--nth-or r 0 "")
-                                               (psql--num (psql--nth-or r 1 "-1"))
-                                               (psql--num (psql--nth-or r 2 "0"))
-                                               (psql--num (psql--nth-or r 3 "0"))
-                                               (psql--num (psql--nth-or r 4 "0"))
-                                               (psql--nth-or r 5 "")))
-                             tabs))
-                 (line (if (equal? (current-buffer) buf) (buffer-line) 0)))
-            (psql--lm-begin! buf)
-            (psql--view-set! buf (list "schema" s))
-            (section-begin)
-            (section-line (string-append "Schema: " s "   Owner: " owner "   "
-                                         (number->string (length rows)) " relations · "
-                                         (psql--human (psql--sum (map (lambda (r) (nth r 2)) rows))))
-                          "psql-header")
-            (when (not (equal? desc "")) (section-line desc "psql-dim"))
-            (psql--emit-hint "RET/g table info · ^ dashboard · r refresh · s query · Y copy · q quit")
-            (section-open 'psql-relations "Relations" "psql-section")
-            (if (null? rows)
-                (section-line "    (no relations)" "psql-dim")
-                (psql--emit-rows
-                 (list "NAME" "TYPE" "~ROWS" "TOTAL" "TABLE" "INDEXES")
-                 rows
-                 (lambda (r)
-                   (if (psql--sizeless? (nth r 0))
-                       (list (nth r 5) (psql--kind (nth r 0)) "-" "-" "-" "-")
-                       (list (nth r 5) (psql--kind (nth r 0)) (psql--rows-h (nth r 1))
-                             (psql--human (nth r 2)) (psql--human (nth r 3))
-                             (psql--human (nth r 4)))))
-                 (lambda (r) (psql--record "table" s (nth r 5)))
-                 #f))
-            (section-close 'psql-relations)
-            (section-render buf "psql-mode")
-            (goto-line line))))))
+         (res (psql--batch
+               (list
+                (list (string-append "select pg_get_userbyid(n.nspowner),"
+                                     " regexp_replace(coalesce(obj_description(n.oid,'pg_namespace'),''), '\\s+', ' ', 'g')"
+                                     " from pg_namespace n where n.nspname = '" sq "'") 2)
+                (list (string-append
+                       "select c.relkind, c.reltuples::bigint, pg_total_relation_size(c.oid),"
+                       " pg_table_size(c.oid), pg_indexes_size(c.oid),"
+                       " coalesce((st.n_dead_tup * 100 / nullif(st.n_live_tup + st.n_dead_tup, 0))::text, ''),"
+                       " c.relname"
+                       " from pg_class c join pg_namespace n on n.oid = c.relnamespace"
+                       " left join pg_stat_all_tables st on st.relid = c.oid"
+                       " where n.nspname = '" sq "' and c.relkind in ('r','p','m','v','f')"
+                       " order by pg_total_relation_size(c.oid) desc, c.relname") 7)))))
+    (when res
+      (let ((info (car (car res))) (tabs (cadr (car res))))
+        (if (null? info)
+            (message (string-append "psql: no such schema — " s))
+            (let* ((buf   (psql--schema-buffer s))
+                   (owner (psql--nth-or (car info) 0 ""))
+                   (desc  (psql--nth-or (car info) 1 ""))
+                   (rows  (map (lambda (r) (list (psql--nth-or r 0 "")
+                                                 (psql--num (psql--nth-or r 1 "-1"))
+                                                 (psql--num (psql--nth-or r 2 "0"))
+                                                 (psql--num (psql--nth-or r 3 "0"))
+                                                 (psql--num (psql--nth-or r 4 "0"))
+                                                 (psql--nth-or r 5 "")
+                                                 (psql--nth-or r 6 "")))
+                               tabs))
+                   (mx (psql--max-of (map (lambda (r) (nth r 2)) rows)))
+                   (line (if (equal? (current-buffer) buf) (buffer-line) 0)))
+              (psql--lm-begin! buf)
+              (psql--view-set! buf (list "schema" s))
+              (section-begin)
+              (section-line (string-append "Schema: " s "   Owner: " owner "   "
+                                           (number->string (length rows)) " relations · "
+                                           (psql--human (psql--sum (map (lambda (r) (nth r 2)) rows))))
+                            "psql-header")
+              (when (not (equal? desc "")) (section-line desc "psql-dim"))
+              (psql--emit-hint "RET/g table info · v preview rows · ^ dashboard · r refresh · s query · Y copy · q quit")
+              (section-open (string-append "psql-relations/" s) "Relations" "psql-section")
+              (if (null? rows)
+                  (section-line "    (no relations)" "psql-dim")
+                  (psql--emit-rows
+                   (list "NAME" "TYPE" "~ROWS" "TOTAL" "TABLE" "INDEXES" "DEAD" "")
+                   rows
+                   (lambda (r)
+                     (if (psql--sizeless? (nth r 0))
+                         (list (nth r 6) (psql--kind (nth r 0)) "-" "-" "-" "-" "" "")
+                         (list (nth r 6) (psql--kind (nth r 0)) (psql--rows-h (nth r 1))
+                               (psql--human (nth r 2)) (psql--human (nth r 3))
+                               (psql--human (nth r 4))
+                               (if (equal? (nth r 5) "")
+                                   ""
+                                   (list (string-append (nth r 5) "%")
+                                         (if (>= (psql--num (nth r 5)) 20) "psql-warn" #f)))
+                               (list (psql--bar (nth r 2) mx 16) "psql-bar"))))
+                   (lambda (r) (psql--record "table" s (nth r 6)))
+                   #f))
+              (section-close (string-append "psql-relations/" s))
+              (section-render buf "psql-mode")
+              (goto-line line)))))))
 
 ;; ── table buffer ──────────────────────────────────────────────────────────────
 (define (psql--table-buffer s t) (string-append "*psql-table:" s "." t "*"))
@@ -479,127 +887,258 @@
         ((equal? c "x") "exclusion")
         (else c)))
 
+;; Free text squeezed onto one line and made safe as a non-final field.
+(define (psql--flat-sql expr)
+  (string-append "replace(regexp_replace(coalesce(" expr ", ''), '\\s+', ' ', 'g'), '|', '¦')"))
+
+;; The table view's queries, in one batch (see psql--batch).
+(define (psql--table-specs oid)
+  (list
+   ;; 0 overview
+   (list (string-append
+          "select c.relkind, pg_get_userbyid(c.relowner), c.reltuples::bigint,"
+          " pg_total_relation_size(c.oid), pg_relation_size(c.oid), pg_table_size(c.oid),"
+          " pg_indexes_size(c.oid), " (psql--flat-sql "obj_description(c.oid, 'pg_class')")
+          " from pg_class c where c.oid = " oid) 8)
+   ;; 1 activity counters
+   (list (string-append
+          "select coalesce(seq_scan,0), coalesce(idx_scan,0), coalesce(n_live_tup,0), coalesce(n_dead_tup,0),"
+          " coalesce(n_tup_ins,0), coalesce(n_tup_upd,0), coalesce(n_tup_del,0), coalesce(n_tup_hot_upd,0),"
+          " coalesce(date_trunc('second', greatest(last_vacuum, last_autovacuum))::text, 'never'),"
+          " coalesce(date_trunc('second', greatest(last_analyze, last_autoanalyze))::text, 'never')"
+          " from pg_stat_all_tables where relid = " oid) 10)
+   ;; 2 cache
+   (list (string-append
+          "select coalesce(heap_blks_hit,0), coalesce(heap_blks_read,0),"
+          " coalesce(idx_blks_hit,0), coalesce(idx_blks_read,0)"
+          " from pg_statio_all_tables where relid = " oid) 4)
+   ;; 3 columns, with keys and planner stats (pg_stats: needs SELECT on the table)
+   (list (string-append
+          "select a.attnum, format_type(a.atttypid, a.atttypmod),"
+          " case when a.attnotnull then 'not null' else '' end,"
+          " concat_ws(',',"
+          "  case when exists (select 1 from pg_constraint k where k.conrelid = a.attrelid"
+          "   and k.contype = 'p' and a.attnum = any(k.conkey)) then 'PK' end,"
+          "  case when exists (select 1 from pg_constraint k where k.conrelid = a.attrelid"
+          "   and k.contype = 'f' and a.attnum = any(k.conkey)) then 'FK' end,"
+          "  case when exists (select 1 from pg_constraint k where k.conrelid = a.attrelid"
+          "   and k.contype = 'u' and a.attnum = any(k.conkey)) then 'UQ' end,"
+          "  case when exists (select 1 from pg_index i where i.indrelid = a.attrelid"
+          "   and a.attnum = any(i.indkey::int2[])) then 'IDX' end),"
+          " coalesce(round((s.null_frac * 100)::numeric, 1)::text || '%', ''),"
+          " case when s.n_distinct is null then ''"
+          "  when s.n_distinct = -1 then 'unique'"
+          "  when s.n_distinct < 0 then round((-s.n_distinct * 100)::numeric)::text || '% of rows'"
+          "  else s.n_distinct::bigint::text end,"
+          " coalesce(s.avg_width::text, ''),"
+          " " (psql--flat-sql "col_description(a.attrelid, a.attnum)") ","
+          " a.attname, " (psql--flat-sql "pg_get_expr(d.adbin, d.adrelid)")
+          " from pg_attribute a"
+          " join pg_class c on c.oid = a.attrelid join pg_namespace n on n.oid = c.relnamespace"
+          " left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum"
+          " left join pg_stats s on s.schemaname = n.nspname and s.tablename = c.relname"
+          "  and s.attname = a.attname"
+          " where a.attrelid = " oid " and a.attnum > 0 and not a.attisdropped"
+          " order by a.attnum") 10)
+   ;; 4 indexes
+   (list (string-append
+          "select pg_relation_size(i.indexrelid), coalesce(st.idx_scan, 0),"
+          " case when i.indisprimary or i.indisunique then 'u' else '' end,"
+          " ic.relname, pg_get_indexdef(i.indexrelid)"
+          " from pg_index i join pg_class ic on ic.oid = i.indexrelid"
+          " left join pg_stat_all_indexes st on st.indexrelid = i.indexrelid"
+          " where i.indrelid = " oid
+          " order by pg_relation_size(i.indexrelid) desc, ic.relname") 5)
+   ;; 5 constraints (FKs carry their target, so RET can follow them)
+   (list (string-append
+          "select con.contype, con.conname, coalesce(fn.nspname, ''), coalesce(fc.relname, ''),"
+          " " (psql--flat-sql "pg_get_constraintdef(con.oid)")
+          " from pg_constraint con"
+          " left join pg_class fc on fc.oid = con.confrelid"
+          " left join pg_namespace fn on fn.oid = fc.relnamespace"
+          " where con.conrelid = " oid
+          " order by con.contype, con.conname") 5)
+   ;; 6 incoming foreign keys
+   (list (string-append
+          "select n.nspname, c.relname, con.conname, " (psql--flat-sql "pg_get_constraintdef(con.oid)")
+          " from pg_constraint con join pg_class c on c.oid = con.conrelid"
+          " join pg_namespace n on n.oid = c.relnamespace"
+          " where con.confrelid = " oid " and con.contype = 'f'"
+          " order by n.nspname, c.relname, con.conname") 4)))
+
+;; Sections are keyed per table, so folding Columns in one table doesn't fold
+;; it in every other table too.
+(define (psql--tsec s t name) (string-append "psql-" name "/" s "." t))
+
+(define (psql--emit-table-size o)
+  (let* ((total (psql--num (psql--nth-or o 3 "0")))
+         (heap (psql--num (psql--nth-or o 4 "0")))
+         (toast (max 0 (- (psql--num (psql--nth-or o 5 "0")) heap)))
+         (idx (psql--num (psql--nth-or o 6 "0")))
+         (parts (list (list "heap" heap) (list "toast" toast) (list "indexes" idx))))
+    (psql--emit-rows (list "" "" "SIZE" "SHARE")
+                     parts
+                     (lambda (p) (list (car p)
+                                       (list (psql--bar (cadr p) total 30) "psql-bar")
+                                       (psql--human (cadr p))
+                                       (psql--pct (if (> total 0) (quotient (* (cadr p) 1000) total) -1))))
+                     #f #f)))
+
+(define (psql--emit-table-stats st io)
+  (let* ((n (lambda (i) (psql--num (psql--nth-or st i "0"))))
+         (live (n 2)) (dead (n 3)) (upd (n 5)) (seq (n 0)) (idx (n 1))
+         (dead-pm (psql--ratio-pm dead live))
+         (heap-hit (psql--ratio-pm (psql--num (psql--nth-or io 0 "0")) (psql--num (psql--nth-or io 1 "0"))))
+         (idx-hit (psql--ratio-pm (psql--num (psql--nth-or io 2 "0")) (psql--num (psql--nth-or io 3 "0")))))
+    (psql--kv "rows" (list (list (string-append "live " (number->string live) " · dead "
+                                                (number->string dead) " (") #f)
+                           (list (psql--pct dead-pm) (if (>= dead-pm 200) "psql-warn" #f))
+                           (list ")" #f)))
+    (psql--kv "writes" (list (list (string-append "ins " (psql--nth-or st 4 "0")
+                                                  " · upd " (number->string upd)
+                                                  " (HOT " (psql--pct (psql--ratio-pm (n 7) (- upd (n 7))))
+                                                  ") · del " (psql--nth-or st 6 "0"))
+                                   #f)))
+    (psql--kv "scans" (list (list (string-append "seq " (number->string seq) " · idx "
+                                                 (number->string idx) "  ") #f)
+                            (list (psql--bar idx (+ seq idx) 10) "psql-bar")
+                            (list (string-append " " (psql--pct (psql--ratio-pm idx seq)) " via index") #f)))
+    (psql--kv "cache hit" (list (list "heap " #f)
+                                (list (psql--pct heap-hit) (psql--hit-face heap-hit))
+                                (list " · indexes " #f)
+                                (list (psql--pct idx-hit) (psql--hit-face idx-hit))))
+    (psql--kv "maintenance" (list (list (string-append "vacuum " (psql--nth-or st 8 "-")
+                                                       " · analyze " (psql--nth-or st 9 "-"))
+                                        #f)))))
+
+(define (psql--emit-columns s t cols)
+  (section-open (psql--tsec s t "columns")
+                (string-append "Columns (" (number->string (length cols)) ")")
+                "psql-section")
+  (if (null? cols)
+      (section-line "    (none)" "psql-dim")
+      (let* ((rows (map (lambda (c)
+                          ;; c = (attnum type notnull keys nulls distinct width comment name default)
+                          (list (list (nth c 0) (nth c 8) (nth c 1)
+                                      (list (nth c 3) "psql-header")
+                                      (nth c 2) (nth c 4) (nth c 5) (nth c 6) (nth c 9))
+                                (nth c 7)))
+                        cols))
+             (ws (psql--widths (map (lambda (r) (map psql--cell-text (car r)))
+                                    (cons (list (list "#" "NAME" "TYPE" "KEY" "NULL" "NULLS"
+                                                      "DISTINCT" "WIDTH" "DEFAULT"))
+                                          rows)))))
+        (psql--emit-row (list "#" "NAME" "TYPE" "KEY" "NULL" "NULLS" "DISTINCT" "WIDTH" "DEFAULT")
+                        ws "psql-dim")
+        (for-each (lambda (r)
+                    (psql--emit-row (car r) ws #f)
+                    ;; the column's comment, under its name
+                    (unless (equal? (cadr r) "")
+                      (section-line (string-append "    " (string-repeat " " (+ (car ws) 2))
+                                                   "— " (cadr r))
+                                    "psql-dim")))
+                  rows)))
+  (section-close (psql--tsec s t "columns"))
+  (section-line "" #f))
+
+(define (psql--emit-indexes s t idxs)
+  (section-open (psql--tsec s t "indexes")
+                (string-append "Indexes (" (number->string (length idxs)) ")")
+                "psql-section")
+  (if (null? idxs)
+      (section-line "    (none)" "psql-dim")
+      (let ((mx (psql--max-of (map (lambda (i) (psql--num (nth i 1))) idxs))))
+        (psql--emit-rows (list "NAME" "SIZE" "SCANS" "" "DEFINITION")
+                         idxs
+                         (lambda (i)
+                           (let ((scans (psql--num (nth i 1))))
+                             (list (nth i 3) (psql--human (psql--num (nth i 0)))
+                                   (if (and (= scans 0) (equal? (nth i 2) ""))
+                                       (list "unused" "psql-warn")
+                                       (nth i 1))
+                                   (list (psql--bar scans mx 12) "psql-bar")
+                                   (nth i 4))))
+                         #f #f)))
+  (section-close (psql--tsec s t "indexes"))
+  (section-line "" #f))
+
+(define (psql--emit-constraints s t cons-)
+  (section-open (psql--tsec s t "constraints")
+                (string-append "Constraints (" (number->string (length cons-)) ")")
+                "psql-section")
+  (if (null? cons-)
+      (section-line "    (none)" "psql-dim")
+      (psql--emit-rows (list "TYPE" "NAME" "DEFINITION")
+                       cons-
+                       (lambda (c) (list (psql--contype (nth c 0)) (nth c 1) (nth c 4)))
+                       ;; a foreign key row opens the table it references
+                       (lambda (c) (unless (equal? (nth c 3) "")
+                                     (psql--record "table" (nth c 2) (nth c 3))))
+                       #f))
+  (section-close (psql--tsec s t "constraints"))
+  (section-line "" #f))
+
+(define (psql--emit-referenced-by s t refs)
+  (section-open (psql--tsec s t "refby")
+                (string-append "Referenced by (" (number->string (length refs)) ")")
+                "psql-section")
+  (if (null? refs)
+      (section-line "    (no foreign keys point here)" "psql-dim")
+      (psql--emit-rows (list "TABLE" "CONSTRAINT" "DEFINITION")
+                       refs
+                       (lambda (r) (list (psql--qual (nth r 0) (nth r 1)) (nth r 2) (nth r 3)))
+                       (lambda (r) (psql--record "table" (nth r 0) (nth r 1)))
+                       #f))
+  (section-close (psql--tsec s t "refby")))
+
 (define (psql--render-table s t)
   (let* ((oid (psql--reloid s t))
-         (ov (psql--query
-              (string-append
-               "select c.relkind, pg_get_userbyid(c.relowner), c.reltuples::bigint,"
-               " pg_size_pretty(pg_total_relation_size(c.oid)),"
-               " pg_size_pretty(pg_table_size(c.oid)),"
-               " pg_size_pretty(pg_indexes_size(c.oid))"
-               " from pg_class c where c.oid = " oid) 6)))
-    (when ov
-      (if (null? ov)
-          (message (string-append "psql: no such relation — " s "." t))
-          (let* ((o     (car ov))
-                 (kind  (psql--nth-or o 0 ""))
-                 (buf   (psql--table-buffer s t))
-                 (stats (psql--query
-                         (string-append
-                          "select coalesce(seq_scan,0), coalesce(idx_scan,0),"
-                          " coalesce(n_live_tup,0), coalesce(n_dead_tup,0),"
-                          " coalesce(date_trunc('second', greatest(last_vacuum, last_autovacuum))::text, 'never'),"
-                          " coalesce(date_trunc('second', greatest(last_analyze, last_autoanalyze))::text, 'never')"
-                          " from pg_stat_all_tables"
-                          " where schemaname = '" (psql--sq s) "' and relname = '" (psql--sq t) "'") 6))
-                 (cols (psql--query
-                        (string-append
-                         "select a.attnum, format_type(a.atttypid, a.atttypmod),"
-                         " case when a.attnotnull then 'not null' else '' end,"
-                         " a.attname, coalesce(pg_get_expr(d.adbin, d.adrelid), '')"
-                         " from pg_attribute a"
-                         " left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum"
-                         " where a.attrelid = " oid " and a.attnum > 0 and not a.attisdropped"
-                         " order by a.attnum") 5))
-                 (idxs (psql--query
-                        (string-append
-                         "select pg_size_pretty(pg_relation_size(i.indexrelid)),"
-                         " coalesce(st.idx_scan, 0), ic.relname, pg_get_indexdef(i.indexrelid)"
-                         " from pg_index i join pg_class ic on ic.oid = i.indexrelid"
-                         " left join pg_stat_all_indexes st on st.indexrelid = i.indexrelid"
-                         " where i.indrelid = " oid
-                         " order by pg_relation_size(i.indexrelid) desc, ic.relname") 4))
-                 (cons- (psql--query
-                         (string-append
-                          "select con.contype, con.conname, pg_get_constraintdef(con.oid)"
-                          " from pg_constraint con where con.conrelid = " oid
-                          " order by con.contype, con.conname") 3))
-                 (line (if (equal? (current-buffer) buf) (buffer-line) 0)))
-            (when (and stats cols idxs cons-)
+         (res (psql--batch (psql--table-specs oid))))
+    (when res
+      (let ((qs (car res)))
+        (if (null? (nth qs 0))
+            (message (string-append "psql: no such relation — " s "." t))
+            (let* ((o     (car (nth qs 0)))
+                   (kind  (psql--nth-or o 0 ""))
+                   (buf   (psql--table-buffer s t))
+                   (st    (if (null? (nth qs 1)) '() (car (nth qs 1))))
+                   (io    (if (null? (nth qs 2)) '() (car (nth qs 2))))
+                   (desc  (psql--nth-or o 7 ""))
+                   (line  (if (equal? (current-buffer) buf) (buffer-line) 0)))
               (psql--lm-begin! buf)
               (psql--view-set! buf (list "table" s t))
               (section-begin)
               (section-line (string-append (psql--kind kind) ": " s "." t
                                            "   Owner: " (psql--nth-or o 1 "?")
-                                           "   Total: " (psql--nth-or o 3 "?")
-                                           " (table " (psql--nth-or o 4 "?")
-                                           " · indexes " (psql--nth-or o 5 "?") ")")
+                                           "   ~" (psql--rows-h (psql--num (psql--nth-or o 2 "-1"))) " rows"
+                                           "   Total: " (psql--human (psql--num (psql--nth-or o 3 "0"))))
                             "psql-header")
-              (let ((st (if (null? stats) '() (car stats))))
-                (section-line
-                 (string-append "~" (psql--rows-h (psql--num (psql--nth-or o 2 "-1"))) " rows"
-                                "   live " (psql--nth-or st 2 "-")
-                                " · dead " (psql--nth-or st 3 "-")
-                                "   scans: seq " (psql--nth-or st 0 "-")
-                                " · idx " (psql--nth-or st 1 "-")
-                                "   vacuum: " (psql--nth-or st 4 "-")
-                                " · analyze: " (psql--nth-or st 5 "-"))
-                 #f))
-              (psql--emit-hint "^ up to schema · r refresh · s query · q quit")
-              ;; columns
-              (section-open 'psql-columns
-                            (string-append "Columns (" (number->string (length cols)) ")")
-                            "psql-section")
-              (if (null? cols)
-                  (section-line "    (none)" "psql-dim")
-                  (psql--emit-rows (list "#" "NAME" "TYPE" "NULL" "DEFAULT")
-                                   cols
-                                   (lambda (c) (list (psql--nth-or c 0 "")
-                                                     (psql--nth-or c 3 "")
-                                                     (psql--nth-or c 1 "")
-                                                     (psql--nth-or c 2 "")
-                                                     (psql--nth-or c 4 "")))
-                                   #f #f))
-              (section-close 'psql-columns)
-              (section-line "" #f)
-              ;; indexes
-              (section-open 'psql-indexes
-                            (string-append "Indexes (" (number->string (length idxs)) ")")
-                            "psql-section")
-              (if (null? idxs)
-                  (section-line "    (none)" "psql-dim")
-                  (psql--emit-rows (list "NAME" "SIZE" "SCANS" "DEFINITION")
-                                   idxs
-                                   (lambda (i) (list (psql--nth-or i 2 "")
-                                                     (psql--nth-or i 0 "")
-                                                     (psql--nth-or i 1 "")
-                                                     (psql--nth-or i 3 "")))
-                                   #f #f))
-              (section-close 'psql-indexes)
-              (section-line "" #f)
-              ;; constraints
-              (section-open 'psql-constraints
-                            (string-append "Constraints (" (number->string (length cons-)) ")")
-                            "psql-section")
-              (if (null? cons-)
-                  (section-line "    (none)" "psql-dim")
-                  (psql--emit-rows (list "TYPE" "NAME" "DEFINITION")
-                                   cons-
-                                   (lambda (c) (list (psql--contype (psql--nth-or c 0 ""))
-                                                     (psql--nth-or c 1 "")
-                                                     (psql--nth-or c 2 "")))
-                                   #f #f))
-              (section-close 'psql-constraints)
+              (unless (equal? desc "") (section-line desc "psql-dim"))
+              (psql--emit-hint "^ up to schema · RET follow foreign key · v preview rows · r refresh · s query · q quit")
+              (unless (psql--sizeless? kind)
+                (section-open (psql--tsec s t "size") "Size" "psql-section")
+                (psql--emit-table-size o)
+                (section-close (psql--tsec s t "size"))
+                (section-line "" #f))
+              (unless (null? st)
+                (section-open (psql--tsec s t "stats") "Stats" "psql-section")
+                (psql--emit-table-stats st io)
+                (section-close (psql--tsec s t "stats"))
+                (section-line "" #f))
+              (psql--emit-columns s t (nth qs 3))
+              (psql--emit-indexes s t (nth qs 4))
+              (psql--emit-constraints s t (nth qs 5))
+              (psql--emit-referenced-by s t (nth qs 6))
               ;; view definition
               (when (member kind (list "v" "m"))
                 (section-line "" #f)
-                (section-open 'psql-viewdef "Definition" "psql-section")
+                (section-open (psql--tsec s t "viewdef") "Definition" "psql-section")
                 (let ((def (psql--raw (string-append "select pg_get_viewdef(" oid ", true)"))))
                   (if (or (not def) (equal? def ""))
                       (section-line "    (unavailable)" "psql-dim")
                       (for-each (lambda (l) (section-line (string-append "    " l) #f))
                                 (split-many def "\n"))))
-                (section-close 'psql-viewdef))
+                (section-close (psql--tsec s t "viewdef")))
               (section-render buf "psql-mode")
               (goto-line line)))))))
 
@@ -638,9 +1177,55 @@
 
 (define-command (psql-toggle-fold) (section-toggle-at-point))
 
+;; v: the first rows of the table at point (or of this table buffer), as a grid.
+(define (psql--ident x) (string-append "\"" (string-join (split-many x "\"") "\"\"") "\""))
+(define (psql--preview-rows) (psql--option-num "psql-preview-rows" 200))
+(define-command (psql-preview)
+  (let* ((e (psql--at))
+         (v (psql--view (current-buffer)))
+         (target (cond ((and e (equal? (nth e 1) "table")) (list (nth e 2) (nth e 3)))
+                       ((and v (equal? (car v) "table")) (list (nth v 1) (nth v 2)))
+                       (else #f))))
+    (if (not target)
+        (message "psql: no table here to preview")
+        (psql--with-url
+          (lambda ()
+            (psql--run-sql (string-append "select * from " (psql--ident (car target)) "."
+                                          (psql--ident (cadr target)) " limit "
+                                          (number->string (psql--preview-rows)) ";")))))))
+
+;; ── auto-refresh ──────────────────────────────────────────────────────────────
+;; One self-rearming timer (the k8s-dashboard pattern). A tick re-renders the
+;; dashboard only while it's the buffer in front — renders are synchronous, so
+;; a background tick would steal focus — and the chain stops once auto-refresh
+;; is off or the dashboard is gone. Interval: the "psql-auto-refresh" option,
+;; in seconds (default 10).
+(define (psql--auto-ms) (* 1000 (max 2 (psql--option-num "psql-auto-refresh" 10))))
+(define (psql--arm-timer)
+  (when (not (psql--st 'timer-armed))
+    (psql--st! 'timer-armed #t)
+    (run-with-timer (psql--auto-ms) "psql--tick")))
+(define-command (psql--tick)
+  (psql--st! 'timer-armed #f)
+  (when (and (psql--st 'auto) (member "*psql-dashboard*" (buffer-names)))
+    (when (and (equal? (current-buffer) "*psql-dashboard*") (not (psql--url-pending?)))
+      (psql--st! 'quiet #t)
+      (psql--render-dashboard)
+      (psql--st! 'quiet #f))
+    (psql--arm-timer)))
+(define-command (psql-toggle-auto)
+  (psql--st! 'auto (not (psql--st 'auto)))
+  (if (psql--st 'auto)
+      (begin (message (string-append "psql: auto-refresh on ("
+                                     (number->string (quotient (psql--auto-ms) 1000)) "s)"))
+             (psql--arm-timer))
+      (message "psql: auto-refresh off"))
+  (when (equal? (current-buffer) "*psql-dashboard*") (psql-refresh)))
+
 (define (psql--apply-url u)
   (set-option "psql-url" (trim-end (trim-start u)))
   (psql--st! 'cat-state "")   ; new database → stale completion catalog
+  (psql--st! 'samples '())    ; …and its counters aren't comparable
   (message (string-append "psql: url set to " (psql--display-url)))
   (when (psql--view (current-buffer)) (psql-refresh)))
 (define-command (psql-set-url . rest)
@@ -725,36 +1310,40 @@
 ;; errors/notices with the output in statement order.
 (define-command (psql-run-buffer)
   (let ((sql (buffer-string)))
-    (cond
-     ((psql--blank? sql) (message "psql: buffer is empty"))
-     ((async-lane-live? "psql")
-      (message "psql: a query is already running — C-g cancels it"))
-     (else
-      (psql--with-url (lambda ()
-      (let ((file (psql--query-file))
-            (status (psql--status-file))
-            (u (psql--url)))
-        (write-file file (string-append "\\timing on\n" sql "\n"))
-        (psql--st! 'async-out '())
-        (psql--st! 'async-n 0)
-        (psql--st! 'capped #f)
-        ;; -A = unaligned output (headers + footers kept) — the display table is
-        ;; built by psql--format-results, with per-cell clamping. FETCH_COUNT
-        ;; streams results in batches so the caps can cut a runaway result off
-        ;; early. psql's own exit code is smuggled out through a status file —
-        ;; the pipeline's code is head's, which is always 0.
-        (async-lane-run "psql" "/bin/sh"
-          (list "-c" (string-append
-                      "{ " (psql--sh-quote (psql--command)) " "
-                      (if (equal? u "") "" (string-append "-d " (psql--sh-quote u) " "))
-                      "-v FETCH_COUNT=100 -X -q -A"
-                      " -P recordsep=" psql--RS " -P fieldsep=" psql--FS
-                      " -P pager=off -f " (psql--sh-quote file)
-                      " 2>&1; echo $? > " (psql--sh-quote status)
-                      "; } | head -c " (number->string (psql--max-output))
-                      "; exit \"$(cat " (psql--sh-quote status) ")\""))
-          'psql--run-output 'psql--run-exit)
-        (message "psql: running… (C-g in the query buffer cancels)"))))))))
+    (if (psql--blank? sql)
+        (message "psql: buffer is empty")
+        (psql--with-url (lambda () (psql--run-sql sql))))))
+
+;; Run `sql` asynchronously; results land in a grid (psql--run-exit).
+(define (psql--run-sql sql)
+  (cond
+   ((async-lane-live? "psql")
+    (message "psql: a query is already running — C-g cancels it"))
+   (else
+    (let ((file (psql--query-file))
+          (status (psql--status-file))
+          (u (psql--url)))
+      (write-file file (string-append "\\timing on\n" sql "\n"))
+      (psql--st! 'async-out '())
+      (psql--st! 'async-n 0)
+      (psql--st! 'capped #f)
+      ;; -A = unaligned output (headers + footers kept) — the display table is
+      ;; built by psql--format-results, with per-cell clamping. FETCH_COUNT
+      ;; streams results in batches so the caps can cut a runaway result off
+      ;; early. psql's own exit code is smuggled out through a status file —
+      ;; the pipeline's code is head's, which is always 0.
+      (async-lane-run "psql" "/bin/sh"
+        (list "-c" (string-append
+                    "{ " (psql--sh-quote (psql--command)) " "
+                    (if (equal? u "") "" (string-append "-d " (psql--sh-quote u) " "))
+                    "-v FETCH_COUNT=100 -X -q -A"
+                    " -P recordsep=" psql--RS " -P fieldsep=" psql--FS
+                    " -P pager=off -f " (psql--sh-quote file)
+                    " 2>&1; echo $? > " (psql--sh-quote status)
+                    "; } | head -c " (number->string (psql--max-output))
+                    "; exit \"$(cat " (psql--sh-quote status) ")\""))
+        'psql--run-output 'psql--run-exit)
+      (message "psql: running… (C-g in the query buffer cancels)")))))
 
 ;; Accumulate as a reversed LIST and join once on exit — appending each line to
 ;; one growing string is quadratic and crawls on megabyte outputs. Past the row
@@ -834,17 +1423,16 @@
              (starts-with? line "psql:")) "psql-err")
         (else "psql-dim")))
 
-;; Walk the raw stream: split on the record sentinel; a chunk whose first line
-;; is data extends the current result set (embedded newlines and all); a chunk
-;; opening with meta lines ends the set — the metas pass through and any
-;; remainder line is the NEXT set's header.
-(define (psql--faced-lines raw)
+;; Walk the raw stream into an ordered list of items: ("set" records) per
+;; result set (its header record first), ("meta" line) for psql chatter. Split
+;; on the record sentinel; a chunk whose first line is data extends the current
+;; result set (embedded newlines and all); a chunk opening with meta lines ends
+;; the set — the metas pass through and any remainder line is the NEXT set's
+;; header.
+(define (psql--result-items raw)
   (let loop ((chunks (split-many raw psql--RS)) (set '()) (acc '()))
     (define (flush acc)
-      (if (null? set)
-          acc
-          (append (reverse (psql--format-block (reverse set)))
-                  (if (null? acc) acc (cons (list "" #f) acc)))))
+      (if (null? set) acc (cons (list "set" (reverse set)) acc)))
     (if (null? chunks)
         (reverse (flush acc))
         (let ((ls (split-many (car chunks) "\n")))
@@ -857,10 +1445,23 @@
                   (walk (cdr ls)
                         (if (equal? (trim-end (car ls)) "")
                             acc
-                            (cons (list (car ls) (psql--result-line-face (car ls))) acc))))
+                            (cons (list "meta" (car ls)) acc))))
                  (else
                   ;; remainder — the next result set's header record
                   (loop (cdr chunks) (list (string-join ls "\n")) acc)))))))))
+
+;; Org-table (text face) lines: each set formatted, a blank line before every
+;; set after the first, metas faced in between.
+(define (psql--faced-lines raw)
+  (let loop ((items (psql--result-items raw)) (acc '()))
+    (cond ((null? items) (reverse acc))
+          ((equal? (car (car items)) "set")
+           (loop (cdr items)
+                 (append (reverse (psql--format-block (cadr (car items))))
+                         (if (null? acc) acc (cons (list "" #f) acc)))))
+          (else
+           (let ((l (cadr (car items))))
+             (loop (cdr items) (cons (list l (psql--result-line-face l)) acc)))))))
 
 ;; Plain-text variant (the org-babel results path).
 (define (psql--format-results raw)
@@ -879,25 +1480,94 @@
      (user-cancelled (message "psql: query cancelled"))
      ((psql--not-found? code) (message (psql--not-found-msg)))
      (else
-        (let* ((raw (string-join (reverse (psql--st 'async-out)) "\n"))
-               (out (if (psql--blank? raw)
-                        "(no output)"
-                        (psql--format-results (trim-end raw))))
+        (let* ((raw (trim-end (string-join (reverse (psql--st 'async-out)) "\n")))
                ;; 141 = SIGPIPE = head hit the raw-stream backstop
                (note (cond ((psql--st 'capped)
-                            "\n\n… truncated at psql-max-rows lines (auto-cancelled) …")
+                            "truncated at psql-max-rows lines (auto-cancelled)")
                            ((equal? code "141")
-                            "\n\n… truncated at psql-max-output bytes …")
+                            "truncated at psql-max-output bytes")
                            (else "")))
-               (truncated (not (equal? note ""))))
-          (write-file (psql--results-file) (string-append out note "\n"))
-          ;; Show results in the OTHER window, so the query stays visible below.
-          (when (equal? (current-buffer) "*psql-query*") (other-window))
-          (kill-buffer-named "results.org")   ; drop a stale view so find-file re-reads
-          (open-file (psql--results-file))
-          (message (cond (truncated "psql: done — output truncated, see results.org")
-                         ((equal? code "0") "psql: done — see results.org")
-                         (else "psql: query failed — see results.org"))))))))
+               (items (if (psql--blank? raw) '() (psql--result-items raw)))
+               (sets (map cadr (filter (lambda (i) (equal? (car i) "set")) items)))
+               (metas (map cadr (filter (lambda (i) (equal? (car i) "meta")) items)))
+               (errored (pair? (filter (lambda (l) (equal? (psql--result-line-face l) "psql-err"))
+                                       metas))))
+          ;; Data with no errors → a grid. Errors, or statements with no result
+          ;; set (DDL, SET, …), → the org results file, where the messages read.
+          (if (and (pair? sets) (not errored) (equal? (psql--results-view) "grid"))
+              (psql--show-grid sets metas note)
+              (psql--show-org raw code note)))))))
+
+;; "grid" (default) or "org" — the "psql-results-view" option.
+(define (psql--results-view)
+  (let ((v (get-option "psql-results-view")))
+    (if (and (string? v) (equal? v "org")) "org" "grid")))
+
+;; open-file's own "Visiting …" lands after anything said in the same command,
+;; so the summary is said a beat later.
+(define (psql--say-later text)
+  (psql--st! 'pending-msg text)
+  (run-with-timer 50 "psql--say-pending"))
+(define (psql--say-pending) (message (psql--st 'pending-msg)))
+
+(define (psql--show-org raw code note)
+  (let ((out (if (psql--blank? raw) "(no output)" (psql--format-results raw))))
+    (write-file (psql--results-file)
+                (string-append out (if (equal? note "") "" (string-append "\n\n… " note " …")) "\n"))
+    ;; Show results in the OTHER window, so the query stays visible below.
+    (when (equal? (current-buffer) "*psql-query*") (other-window))
+    (kill-buffer-named "results.org")   ; drop a stale view so find-file re-reads
+    (open-file (psql--results-file))
+    (psql--say-later (cond ((not (equal? note "")) (string-append "psql: done — " note ", see results.org"))
+                   ((equal? code "0") "psql: done — see results.org")
+                   (else "psql: query failed — see results.org")))))
+
+;; ── results as a grid ─────────────────────────────────────────────────────────
+;; Each result set becomes a CSV, which macros opens as a grid (sort, filter,
+;; resize, copy, formulas). The LAST set is shown — with several statements
+;; that's usually the one you care about; earlier sets sit next to it as
+;; psql-result-1.csv, psql-result-2.csv, … Cells are the full values (no
+;; clamping: the grid truncates for display, not the data).
+(define (psql--grid-file i)
+  (string-append (psql--tmpdir) "/macros-psql/psql-result"
+                 (if (= i 0) "" (string-append "-" (number->string i))) ".csv"))
+(define (psql--csv-cell c)
+  (if (or (string-contains? c ",") (string-contains? c "\"")
+          (string-contains? c "\n") (string-contains? c "\r"))
+      (string-append "\"" (string-join (split-many c "\"") "\"\"") "\"")
+      c))
+(define (psql--csv records)
+  (string-join (map (lambda (rec) (string-join (map psql--csv-cell (split-many rec psql--FS)) ","))
+                    records)
+               "\n"))
+
+(define (psql--show-grid sets metas note)
+  (let loop ((ss sets) (i 1))
+    (when (pair? ss)
+      (write-file (psql--grid-file (if (null? (cdr ss)) 0 i))
+                  (string-append (psql--csv (car ss)) "\n"))
+      (loop (cdr ss) (+ i 1))))
+  (when (equal? (current-buffer) "*psql-query*") (other-window))
+  (kill-buffer-named "psql-result.csv")   ; drop a stale grid so it re-reads
+  (open-file (psql--grid-file 0))
+  (let* ((rows (filter (lambda (l) (and (starts-with? l "(") (string-contains? l "row"))) metas))
+         (times (filter (lambda (l) (starts-with? l "Time:")) metas))
+         (parts (append (if (null? rows) '() (list (car (reverse rows))))
+                        (if (null? times) '() (list (car (reverse times))))
+                        (if (> (length sets) 1)
+                            (list (string-append (number->string (length sets))
+                                                 " result sets — showing the last; earlier ones are psql-result-N.csv"))
+                            '())
+                        (if (equal? note "") '() (list note)))))
+    (psql--say-later (string-append "psql: " (if (null? parts) "done" (string-join parts " · "))))))
+
+;; Header row + frozen header for our result grids.
+(define (psql--grid-load name)
+  (when (starts-with? name "psql-result")
+    (grid-set-header #t)
+    (grid-freeze-rows 1)))
+(remove-hook "grid-load-hook" "psql--grid-load")
+(add-hook "grid-load-hook" "psql--grid-load")
 
 ;; C-g in a sql buffer: cancel a live query, else the ordinary keyboard-quit.
 (define-command (psql-query-cancel) (async-lane-quit "psql"))
@@ -1133,6 +1803,7 @@
       (transient (string-append "Table: " (nth e 2) "." (nth e 3))
         (list (list "Inspect"
                     (list "i" "Table info"       'psql-visit)
+                    (list "v" "Preview rows"     'psql-preview)
                     (list "shift-y" "Copy name"  'psql-copy))
               (list "View"
                     (list "s" "SQL query"        'psql-query)
@@ -1152,7 +1823,9 @@
       (transient "PostgreSQL"
         (list (list "View"
                     (list "r" "Refresh"          'psql-refresh)
+                    (list "a" "Auto-refresh"     'psql-toggle-auto)
                     (list "s" "SQL query"        'psql-query)
+                    (list "v" "Preview rows"     'psql-preview)
                     (list "shift-u" "Set URL"    'psql-set-url)
                     (list "^" "Up a level"       'psql-up)
                     (list "q" "Close"            'transient-quit))))))))
@@ -1165,6 +1838,8 @@
 (define-key "psql-mode" "enter" 'psql-visit)
 (define-key "psql-mode" "g" 'psql-visit)
 (define-key "psql-mode" "s" 'psql-query)
+(define-key "psql-mode" "v" 'psql-preview)
+(define-key "psql-mode" "a" 'psql-toggle-auto)
 (define-key "psql-mode" "^" 'psql-up)
 (define-key "psql-mode" "shift-u" 'psql-set-url)
 (define-key "psql-mode" "shift-y" 'psql-copy)

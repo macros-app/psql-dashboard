@@ -21,7 +21,7 @@ pane), and `lib-transient` (the `?` popup).
 
 - The [macros](https://github.com/kylegwinnup/macros) editor.
 - `psql` on your `PATH` (any reasonably recent PostgreSQL client; the catalog
-  queries need server ≥ 9.4).
+  queries need server ≥ 10).
 
 ## Install
 
@@ -76,7 +76,17 @@ point it at the binary directly:
 
 Faces are user-overridable — redefine after loading (and re-apply after a
 `load-theme`, which wipes the palette): `psql-header`, `psql-section`,
-`psql-ok`, `psql-warn`, `psql-err`, `psql-dim`.
+`psql-ok`, `psql-warn`, `psql-err`, `psql-dim`, `psql-bar` (inline bars and
+sparklines).
+
+Other options (all strings, like every option):
+
+```scheme
+(set-option "psql-dashboard-rows" "15")   ; relations per schema on the dashboard
+(set-option "psql-auto-refresh" "10")     ; auto-refresh interval, seconds
+(set-option "psql-preview-rows" "200")    ; rows `v` fetches
+(set-option "psql-results-view" "grid")   ; or "org" for org-table results
+```
 
 ## Launch
 
@@ -92,34 +102,67 @@ The package adds **no global keybindings**. Bind it yourself if you want a key
 ## The dashboard
 
 ```
-Database: mydb   PostgreSQL 16.3   postgres://kyle:***@localhost:5432/mydb
-Size: 7509 kB   User: kyle   Connections: 5 (1 active)
+Database: mydb   PostgreSQL 16.3   postgres://kyle:***@db:5432/mydb
+Size: 1003.2 MB   User: kyle   Up: 105d6h   Connections: 11/400 ▎   1 active · 0 idle in xact · 0 waiting on locks
+Cache hit: 99.9% ██████████   TPS: ▅▅▅█ 32/s   Deadlocks: 0   Temp: 339.7 MB
 
-public  (12 relations · 1.2 GB · kyle)
-    NAME       TYPE   ~ROWS  SIZE
-    events     table  4.1M   890.0 MB
-    users      table  1.5k   80.0 KB
-    user_view  view   -      -
+Attention (3)
+       CHECK          RELATION              DETAIL
+    ▲  empty but big  public.stream_events  14 MB on disk with ~0 live rows — bloat (VACUUM FULL)
+    ·  unused index   public.memories       idx_memories_embedding · 11 MB · 0 scans
+    ·  not analyzed   -                     61 small tables (< 1 MB) never analyzed — their ~ROWS show ?
 
-Activity (1)
-    PID  USER  STATE   TIME      QUERY
-    123  kyle  active  00:00:01  select …
+Trends            (a TPS chart, from the third refresh on)
+
+Activity (1 non-idle)
+    PID  USER  STATE   WAIT  TIME  BLOCKED BY  QUERY
+    123  kyle  active        12s               select …
+
+public  (143 relations · 989.6 MB · kyle)
+    NAME          TYPE   ~ROWS  SIZE
+    llm_messages  table  98.1k  257.2 MB  ████████████████
+    events        table  198k   209.3 MB  █████████████
+    …
+    … 128 more — RET opens public
 ```
 
-Each schema is a foldable section listing its relations sorted by size —
-`TAB` folds/unfolds it, magit-style. `~ROWS` is the planner's estimate
-(`reltuples` — `?` until first `ANALYZE`). The **Activity** section shows the
-other backends connected to this database (state, running time, current query).
+- The **header** shows connections against `max_connections`, the cumulative
+  cache hit ratio, and TPS. TPS is a rate, so it needs two refreshes; each
+  refresh adds a sample (`a` auto-refreshes). It includes the dashboard's own
+  queries, about 9 per refresh.
+- **Attention** lists things worth a look: blocked sessions, queries running
+  over 5 minutes, sessions idle in a transaction over 1 minute, transaction ID
+  age, tables with over 20% dead rows, big tables with ~0 live rows (bloat),
+  mostly-sequential-scan tables, unused non-unique indexes over 1 MB, and
+  never-analyzed tables. `RET` on a row opens its table.
+- **Activity** lists non-idle client sessions, longest-running first, with
+  wait event and the pids blocking them.
+- **Top queries** appears when `pg_stat_statements` is installed.
+- Each **schema** shows its largest `psql-dashboard-rows` relations with a size
+  bar; the `… N more` line opens the full list. `~ROWS` is the planner's
+  estimate (`reltuples`, `?` until the first `ANALYZE`).
+
+All of a view's catalog queries run over one psql connection.
 
 ## Drill-down
 
-- `RET` / `g` on a **schema heading** → `*psql-schema:S*` — owner,
-  description, and every relation with a size breakdown (total / table /
-  indexes).
-- `RET` / `g` on a **table row** → `*psql-table:S.T*` — sizes, row estimate,
-  scan and vacuum/analyze stats, then foldable **Columns** (type, null,
-  default), **Indexes** (size, scans, definition), **Constraints**, and — for
-  views and matviews — the **Definition**.
+- `RET` / `g` on a **schema heading** → `*psql-schema:S*` — every relation with
+  total / table / index sizes, dead-row %, and a size bar.
+- `RET` / `g` on a **table row** → `*psql-table:S.T*`:
+  - **Size**: heap / TOAST / indexes as bars with their share of the total.
+  - **Stats**: live and dead rows, writes (with HOT-update %), seq vs index
+    scans, heap and index cache hit, last vacuum / analyze.
+  - **Columns**: type, `PK`/`FK`/`UQ`/`IDX` markers, not-null, and the
+    planner's statistics (null %, distinct values, average width), with each
+    column's comment underneath.
+  - **Indexes**: size and scans as bars, with unused indexes flagged.
+  - **Constraints**: `RET` on a foreign key opens the table it references.
+  - **Referenced by**: incoming foreign keys; `RET` opens the referencing table.
+  - For views and matviews, the **Definition**.
+
+  Long definitions wrap under their column. Fold state is per table.
+- `v` on a table row (or in a table buffer) previews its first
+  `psql-preview-rows` rows as a grid.
 - `^` goes back up a level (table → schema → dashboard).
 
 ## Keys
@@ -129,6 +172,8 @@ In the dashboard / schema / table buffers (`psql-mode`):
 | Key           | Action                                                     |
 | ------------- | ---------------------------------------------------------- |
 | `r`           | refresh the current buffer                                 |
+| `a`           | toggle dashboard auto-refresh                              |
+| `v`           | preview the table at point as a grid                       |
 | `RET` / `g`   | drill into the schema / table at point                     |
 | `TAB`         | fold / unfold the section at point                         |
 | `^`           | up a level (table → schema → dashboard)                    |
@@ -155,10 +200,16 @@ all your usual keymaps. Then:
 | `C-c C-g`   | cancel the running query (plain `C-g` also works under Emacs bindings — evil intercepts it) |
 | `C-c C-k`   | close the query pane                                          |
 
-Results open in `*psql-results*` in the other window, so the query stays
-visible: psql's own aligned table output, `(N rows)` footers, and `\timing`
-per statement. Errors and notices are interleaved in statement order. The
-buffer may hold multiple statements — each runs in order in one session.
+Results open in the other window, so the query stays visible, as a **grid**
+(a CSV in macros' grid mode: sort, filter, resize columns, copy, formulas).
+The header row is frozen, cells hold full values, and the echo area shows the
+row count and `\timing`. The buffer may hold several statements; they run in
+order in one session, and the **last** result set is shown, with earlier ones
+written next to it as `psql-result-N.csv`.
+
+If a statement errors, or nothing returns rows (DDL, `SET`, …), the output
+opens as the org results described below instead, so messages are readable.
+Set `psql-results-view` to `"org"` to always get org tables.
 
 These bindings live in the `sql` major-mode keymap, so `C-c C-c` also runs the
 contents of **any `.sql` file buffer** against the configured URL — the Emacs
@@ -187,8 +238,8 @@ any dashboard refresh retries.
 
 Queries run with **sentinel record/field separators** (`-P recordsep` /
 `-P fieldsep`), so row and cell boundaries are exact — a value containing a
-newline or a `|` cannot break its row. Every row lands in the table. Each
-result set is formatted as an **org-mode table**, cells clamped to 80 chars
+newline or a `|` cannot break its row. Every row lands in the table. In the org
+view (and for babel blocks), each result set is formatted as an **org-mode table**, cells clamped to 80 chars
 (`…` marks a clamped cell) and embedded newlines shown as `⏎`:
 
 ```
@@ -247,7 +298,7 @@ and everything else still works.
 
 ## The `?` popup
 
-With point on a table, `?` offers table info / copy / query / refresh; on a
+With point on a table, `?` offers table info / preview / copy / query / refresh; on a
 schema heading, schema info / fold / copy; anywhere else, a view menu (refresh,
 query, set URL, up).
 
@@ -259,8 +310,9 @@ query, set URL, up).
   default expression can't shift columns. A `|` inside a *schema or table
   name* would still confuse the dashboard — don't do that.
 - Row counts are planner estimates (`pg_class.reltuples`), not `count(*)`.
-- Dashboard/drill-down catalog queries are synchronous (they're small);
-  only the query pane runs async.
+- Dashboard/drill-down catalog queries are synchronous (one psql run per
+  view); only the query pane runs async. Auto-refresh therefore only redraws
+  while the dashboard is the buffer in front.
 - System schemas (`pg_*`, `information_schema`) are hidden.
 
 ## License
