@@ -70,8 +70,16 @@
 ;; that talks to the server runs through here first: `option-ensure` prompts for
 ;; the passphrase, then for the URL itself if there's no entry yet (offering to
 ;; save it). A plain or unset option runs `k` immediately.
+;; The ensure can still come back without a value (e.g. saving to authinfo.gpg
+;; failed), so check again rather than silently connecting to the PG* defaults.
 (define (psql--with-url k)
-  (option-ensure "psql-url" k
+  (option-ensure "psql-url"
+                 (lambda ()
+                   (if (psql--url-pending?)
+                       (message (string-append "psql: no value for psql-url ("
+                                               (option-secret-label "psql-url")
+                                               ") — see *Messages* for authinfo errors"))
+                       (k)))
                  'on-cancel (lambda (_) (message "psql: no connection URL — cancelled"))))
 ;; Synchronous callers (org-babel) can't prompt: #t while a referenced URL is
 ;; still locked away.
