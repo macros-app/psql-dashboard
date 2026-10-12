@@ -226,6 +226,23 @@ These bindings live in the `sql` major-mode keymap, so `C-c C-c` also runs the
 contents of **any `.sql` file buffer** against the configured URL — the Emacs
 `sql-mode` habit.
 
+### History
+
+Every query you run from the query pane is saved, newest first, to
+`~/.config/macros/psql-history` (duplicates collapse to the newest copy; the
+last 500 are kept). Queries the package runs itself, like `v` previews, are not
+saved.
+
+| Key              | Action                                                    |
+| ---------------- | --------------------------------------------------------- |
+| `up` / `down`    | in an **empty** query pane, recall the previous query; keep pressing to step older / newer (normal state, evil or helix) |
+| `M-p` / `M-n`    | the same, in any state (insert, Emacs bindings)           |
+
+Stepping continues while the pane still shows the recalled query untouched;
+`down` past the newest empties the pane again. Once you edit the query, or the
+pane wasn't empty to begin with, the arrows move the cursor as usual. Recall a
+query, then `C-c C-c` to run it again.
+
 ### Completion
 
 The query pane (and any `.sql` buffer) completes from the **connected
