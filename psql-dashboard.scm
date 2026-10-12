@@ -31,6 +31,7 @@
 ;;;                           (`s` from any dashboard buffer, or M-x psql-query).
 ;;;                           C-c C-c runs the buffer's SQL asynchronously;
 ;;;                           C-g cancels a running query; C-c C-k closes it.
+;;;                           `up` in the empty pane (or M-p) recalls history.
 ;;;   psql-result.csv         the query output as a grid (errors / no rows →
 ;;;                           results.org instead).
 ;;;
@@ -123,6 +124,10 @@
    'pending-msg ""  ; echo-area summary shown after a results file opens
    'back        '() ; buffer -> the psql buffer RET opened it from (for q)
    'grid-widths '() ; column widths (chars) for the result grid being opened
+   ;; query history browsing (see the query history section)
+   'hist-entries '() ; history snapshot taken when browsing started
+   'hist-pos    -1  ; index of the entry on screen, -1 = not browsing
+   'hist-shown  ""  ; the text that entry put in the buffer
    ))
 (define (psql--st key) (hash-try-get psql-state key))
 (define (psql--st! key val) (set! psql-state (hash-insert psql-state key val)))
@@ -1333,7 +1338,10 @@
   (let ((sql (buffer-string)))
     (if (psql--blank? sql)
         (message "psql: buffer is empty")
-        (psql--with-url (lambda () (psql--run-sql sql))))))
+        (psql--with-url (lambda ()
+                          (when (equal? (current-buffer) "*psql-query*")
+                            (psql--history-add! sql))
+                          (psql--run-sql sql))))))
 
 ;; Run `sql` asynchronously; results land in a grid (psql--run-exit).
 (define (psql--run-sql sql)
@@ -1624,6 +1632,89 @@
     (when in-pane (delete-window))
     (message "psql: query buffer closed")))
 
+;; ── query history ─────────────────────────────────────────────────────────────
+;; Every query run by hand from *psql-query* is saved, newest first, to
+;; ~/.config/macros/psql-history (deduplicated, capped). `up` in an empty query
+;; pane recalls the previous query; `up` / `down` keep stepping while the buffer
+;; still shows an untouched entry, and `down` past the newest clears it again.
+;; Anything else — a non-empty buffer, an edited entry, other sql buffers —
+;; gets the ordinary line motion. M-p / M-n do the same and work in every state
+;; (arrow keys only reach package keymaps in evil / helix normal state).
+(define psql--history-sep "\n@@ENTRY@@\n")
+(define psql--history-max 500)
+(define (psql--history-file)
+  (string-append (persistence-directory) "/psql-history"))
+
+(define (psql--history-read)
+  (let ((f (psql--history-file)))
+    (if (file-exists? f)
+        (filter (lambda (q) (not (psql--blank? q)))
+                (split-many (read-file f) psql--history-sep))
+        '())))
+
+(define (psql--history-add! sql)
+  (let* ((q (trim sql))
+         (rest (filter (lambda (e) (not (equal? e q))) (psql--history-read))))
+    (write-file (psql--history-file)
+                (string-join (psql--take (cons q rest) psql--history-max)
+                             psql--history-sep))))
+
+;; Browse state: 'hist-pos is the index of the entry on screen (-1 = not
+;; browsing), 'hist-shown its text — browsing continues only while the buffer
+;; still holds exactly that text.
+(define (psql--history-browsing?)
+  (and (equal? (current-buffer) "*psql-query*")
+       (let ((pos (psql--st 'hist-pos)))
+         (and (>= pos 0)
+              (equal? (buffer-string) (psql--st 'hist-shown))))))
+
+(define (psql--history-show! entries pos)
+  (let ((text (if (< pos 0) "" (nth entries pos))))
+    (delete-region 0 (point-max))
+    (insert text)                       ; leaves point at the end
+    (psql--st! 'hist-entries entries)
+    (psql--st! 'hist-pos pos)
+    (psql--st! 'hist-shown text)
+    (message (if (< pos 0)
+                 "psql: end of history"
+                 (string-append "psql: history " (number->string (+ pos 1))
+                                "/" (number->string (length entries)))))))
+
+;; #t when handled; #f → the caller does its ordinary motion.
+(define (psql--history-older)
+  (cond
+   ((psql--history-browsing?)
+    (let ((entries (psql--st 'hist-entries)) (pos (psql--st 'hist-pos)))
+      (if (< (+ pos 1) (length entries))
+          (psql--history-show! entries (+ pos 1))
+          (message "psql: oldest query in history"))
+      #t))
+   ((and (equal? (current-buffer) "*psql-query*") (psql--blank? (buffer-string)))
+    (let ((entries (psql--history-read)))
+      (if (null? entries)
+          (message "psql: no query history yet")
+          (psql--history-show! entries 0))
+      #t))
+   (else #f)))
+(define (psql--history-newer)
+  (if (psql--history-browsing?)
+      (begin (psql--history-show! (psql--st 'hist-entries) (- (psql--st 'hist-pos) 1))
+             #t)
+      #f))
+
+(define-command (psql-history-previous) (psql--history-older))
+(define-command (psql-history-next) (psql--history-newer))
+(define-command (psql-history-up)
+  (unless (psql--history-older) (previous-line)))
+(define-command (psql-history-down)
+  (unless (psql--history-newer) (next-line)))
+;; Helix's own arrow motion; only bound in helix-normal, where helix.scm is
+;; loaded (eval-string so this file still loads without it).
+(define-command (psql-history-up-helix)
+  (unless (psql--history-older) (eval-string "(helix-line-up)")))
+(define-command (psql-history-down-helix)
+  (unless (psql--history-newer) (eval-string "(helix-line-down)")))
+
 ;; ── org-babel (#+BEGIN_SRC psql / sql) ───────────────────────────────────────
 ;; C-c C-c (org-babel-execute) inside a `psql` or `sql` src block runs its body
 ;; against the configured URL and writes the aligned, cell-clamped table into
@@ -1913,6 +2004,13 @@
 ;; plain Emacs bindings.
 (define-key "sql" "ctrl-g" 'psql-query-cancel)
 (define-key "sql" "ctrl-c ctrl-g" 'psql-query-cancel)
+;; Query history (see the query history section).
+(define-key "sql" "alt-p" 'psql-history-previous)
+(define-key "sql" "alt-n" 'psql-history-next)
+(define-key "evil-normal:sql" "up" 'psql-history-up)
+(define-key "evil-normal:sql" "down" 'psql-history-down)
+(define-key "helix-normal:sql" "up" 'psql-history-up-helix)
+(define-key "helix-normal:sql" "down" 'psql-history-down-helix)
 
 ;; ── evil / helix motion overlays ──────────────────────────────────────────────
 ;; Special buffers drive their own keymaps; the editor consults an
