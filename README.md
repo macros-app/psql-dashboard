@@ -226,6 +226,22 @@ These bindings live in the `sql` major-mode keymap, so `C-c C-c` also runs the
 contents of **any `.sql` file buffer** against the configured URL — the Emacs
 `sql-mode` habit.
 
+### Variables
+
+psql variables work in the buffer: `:name`, `:'name'` (as a quoted literal)
+and `:"name"` (as a quoted identifier). Before a run, every variable the SQL
+references but doesn't `\set` itself is asked for in the minibuffer, pre-filled
+with the value you gave last time, and passed to psql as `-v name=value`:
+
+```sql
+select * from dd_lease_review_decisions where deal_id = :'deal';
+```
+
+An empty answer leaves the variable unset. References inside strings,
+comments, dollar quotes and `::` casts are ignored, as are psql's built-ins
+(`:DBNAME`, `:USER`, …). A buffer that uses `\gset` is never prompted, since
+its variables come from query results.
+
 ### History
 
 Every query you run from the query pane is saved, newest first, to

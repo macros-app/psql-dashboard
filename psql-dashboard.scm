@@ -128,6 +128,8 @@
    'hist-entries '() ; history snapshot taken when browsing started
    'hist-pos    -1  ; index of the entry on screen, -1 = not browsing
    'hist-shown  ""  ; the text that entry put in the buffer
+   ;; psql variables (see the query variables section)
+   'vars        '() ; name -> last value given for a :'name' reference
    ))
 (define (psql--st key) (hash-try-get psql-state key))
 (define (psql--st! key val) (set! psql-state (hash-insert psql-state key val)))
@@ -1341,10 +1343,150 @@
         (psql--with-url (lambda ()
                           (when (equal? (current-buffer) "*psql-query*")
                             (psql--history-add! sql))
-                          (psql--run-sql sql))))))
+                          (psql--read-vars (psql--unset-vars sql) '()
+                                           (lambda (vars) (psql--run-sql sql vars))))))))
 
-;; Run `sql` asynchronously; results land in a grid (psql--run-exit).
-(define (psql--run-sql sql)
+;; ── query variables ───────────────────────────────────────────────────────────
+;; psql interpolates `:name`, `:'name'` (as a literal) and `:"name"` (as an
+;; identifier) client-side — but leaves the text untouched when the variable is
+;; unset, so the server sees `:'deal'` and fails with a syntax error. Before a
+;; run, every variable the SQL references but doesn't `\set` itself is read in
+;; the minibuffer (pre-filled with the last value given) and passed as
+;; `-v name=value`. An empty answer leaves it unset — so a false positive like
+;; an array slice `a[lo:hi]` costs one RET, not a broken query.
+(define psql--builtin-vars
+  '("AUTOCOMMIT" "COMP_KEYWORD_CASE" "DBNAME" "ECHO" "ECHO_HIDDEN" "ENCODING"
+    "ERROR" "FETCH_COUNT" "HIDE_TABLEAM" "HIDE_TOAST_COMPRESSION" "HISTCONTROL"
+    "HISTFILE" "HISTSIZE" "HOST" "IGNOREEOF" "LASTOID" "LAST_ERROR_MESSAGE"
+    "LAST_ERROR_SQLSTATE" "ON_ERROR_ROLLBACK" "ON_ERROR_STOP" "PORT" "PROMPT1"
+    "PROMPT2" "PROMPT3" "QUIET" "ROW_COUNT" "SERVER_VERSION_NAME"
+    "SERVER_VERSION_NUM" "SHELL_ERROR" "SHELL_EXIT_CODE" "SHOW_ALL_RESULTS"
+    "SHOW_CONTEXT" "SINGLELINE" "SINGLESTEP" "SQLSTATE" "USER" "VERBOSITY"
+    "VERSION" "VERSION_NAME" "VERSION_NUM" "WATCH_INTERVAL"))
+
+(define (psql--var-char? c)
+  (let ((cp (char->integer c)))
+    (or (and (>= cp 48) (<= cp 57))     ; 0-9
+        (and (>= cp 65) (<= cp 90))     ; A-Z
+        (and (>= cp 97) (<= cp 122))    ; a-z
+        (= cp 95) (> cp 127))))         ; _ and non-ASCII, as psql allows
+(define (psql--var-start? c)
+  (let ((cp (char->integer c)))
+    (and (psql--var-char? c) (not (and (>= cp 48) (<= cp 57))))))
+;; The leading run of variable-name chars: (name . rest-of-chars).
+(define (psql--take-name cs)
+  (let loop ((cs cs) (acc '()))
+    (if (and (pair? cs) (psql--var-char? (car cs)))
+        (loop (cdr cs) (cons (car cs) acc))
+        (cons (list->string (reverse acc)) cs))))
+;; Chars after the first `ch` (or '() when there is none).
+(define (psql--skip-to cs ch)
+  (cond ((null? cs) '())
+        ((char=? (car cs) ch) (cdr cs))
+        (else (psql--skip-to (cdr cs) ch))))
+;; Chars after the first occurrence of the char list `needle`.
+(define (psql--skip-past cs needle)
+  (define (prefix? n c)
+    (cond ((null? n) #t)
+          ((null? c) #f)
+          ((char=? (car n) (car c)) (prefix? (cdr n) (cdr c)))
+          (else #f)))
+  (cond ((null? cs) '())
+        ((prefix? needle cs) (list-tail cs (length needle)))
+        (else (psql--skip-past (cdr cs) needle))))
+(define (psql--skip-blank cs)
+  (if (and (pair? cs) (or (char=? (car cs) #\space) (char=? (car cs) #\tab)))
+      (psql--skip-blank (cdr cs))
+      cs))
+
+;; Scan `sql` the way psql's lexer does — skipping comments, quoted strings,
+;; quoted identifiers, dollar quotes and `::` casts — and return
+;; (referenced-names set-names gset?), names in first-seen order. Backslash
+;; meta-commands are skipped to end of line; `\set NAME` records NAME, and a
+;; `\gset` makes the set of defined names unknowable.
+(define (psql--scan-vars sql)
+  (let loop ((cs (string->list sql)) (refs '()) (defs '()) (gset #f))
+    (define (ref n) (if (or (equal? n "") (member n refs)) refs (cons n refs)))
+    (if (null? cs)
+        (list (reverse refs) defs gset)
+        (let* ((c (car cs))
+               (rest (cdr cs))
+               (nx (if (pair? rest) (car rest) #\space)))
+          (cond
+           ((and (char=? c #\-) (char=? nx #\-))
+            (loop (psql--skip-to rest #\newline) refs defs gset))
+           ((and (char=? c #\/) (char=? nx #\*))
+            (loop (psql--skip-past (cdr rest) (list #\* #\/)) refs defs gset))
+           ((char=? c #\') (loop (psql--skip-to rest #\') refs defs gset))
+           ((char=? c #\") (loop (psql--skip-to rest #\") refs defs gset))
+           ((char=? c #\$)                    ; $tag$ … $tag$ (not a $1 param)
+            (let* ((t (psql--take-name rest))
+                   (tag (car t))
+                   (after (cdr t)))
+              (if (and (pair? after) (char=? (car after) #\$)
+                       (or (equal? tag "") (psql--var-start? (car rest))))
+                  (loop (psql--skip-past (cdr after)
+                                         (append (list #\$) (string->list tag) (list #\$)))
+                        refs defs gset)
+                  (loop rest refs defs gset))))
+           ((char=? c #\\)
+            (let* ((cmd (psql--take-name rest))
+                   (name (car (psql--take-name (psql--skip-blank (cdr cmd)))))
+                   (eol (psql--skip-to (cdr cmd) #\newline)))
+              (cond ((and (equal? (car cmd) "set") (not (equal? name "")))
+                     (loop eol refs (cons name defs) gset))
+                    ((equal? (car cmd) "gset") (loop eol refs defs #t))
+                    (else (loop eol refs defs gset)))))
+           ((char=? c #\:)
+            (cond
+             ((char=? nx #\:) (loop (cdr rest) refs defs gset))
+             ((or (char=? nx #\') (char=? nx #\"))
+              (let ((t (psql--take-name (cdr rest))))
+                (if (and (not (equal? (car t) "")) (pair? (cdr t))
+                         (char=? (car (cdr t)) nx))
+                    (loop (cdr (cdr t)) (ref (car t)) defs gset)
+                    (loop rest refs defs gset))))
+             ((psql--var-start? nx)
+              (let ((t (psql--take-name rest)))
+                (loop (cdr t) (ref (car t)) defs gset)))
+             (else (loop rest refs defs gset))))
+           (else (loop rest refs defs gset)))))))
+
+;; Variables `sql` references that nothing sets: not \set in the buffer, not a
+;; psql built-in. A `\gset` anywhere means we can't tell — ask for nothing.
+(define (psql--unset-vars sql)
+  (let* ((scan (psql--scan-vars sql))
+         (defs (cadr scan)))
+    (if (caddr scan)
+        '()
+        (filter (lambda (n) (not (or (member n defs) (member n psql--builtin-vars))))
+                (car scan)))))
+
+;; Read each of `names` in turn, then call (k ((name . value) …)). Answers are
+;; remembered as the next run's pre-fill; an empty one leaves the name unset.
+(define (psql--read-vars names acc k)
+  (if (null? names)
+      (k (reverse acc))
+      (let* ((n (car names))
+             (last (alist-ref (psql--st 'vars) n)))
+        (read-string (string-append "psql :" n " = ")
+                     (lambda (v)
+                       (psql--st! 'vars (psql--alist-set (psql--st 'vars) n v))
+                       (psql--read-vars (cdr names)
+                                        (if (equal? v "") acc (cons (cons n v) acc))
+                                        k))
+                     (if (string? last) last "")))))
+
+;; ` -v 'name=value'` for each (name . value) — psql's own -v quoting rules.
+(define (psql--var-args vars)
+  (apply string-append
+         (map (lambda (kv)
+                (string-append " -v " (psql--sh-quote (string-append (car kv) "=" (cdr kv)))))
+              vars)))
+
+;; Run `sql` asynchronously; results land in a grid (psql--run-exit). The
+;; optional `vars` are ((name . value) …) passed to psql as -v.
+(define (psql--run-sql sql . rest)
   (cond
    ((async-lane-live? "psql")
     (message "psql: a query is already running — C-g cancels it"))
@@ -1365,7 +1507,8 @@
         (list "-c" (string-append
                     "{ " (psql--sh-quote (psql--command)) " "
                     (if (equal? u "") "" (string-append "-d " (psql--sh-quote u) " "))
-                    "-v FETCH_COUNT=100 -X -q -A"
+                    "-v FETCH_COUNT=100" (psql--var-args (if (null? rest) '() (car rest)))
+                    " -X -q -A"
                     " -P recordsep=" psql--RS " -P fieldsep=" psql--FS
                     " -P pager=off -f " (psql--sh-quote file)
                     " 2>&1; echo $? > " (psql--sh-quote status)
