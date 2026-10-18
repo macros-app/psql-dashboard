@@ -3,9 +3,10 @@
 ;;; A magit-style porcelain for `psql`. The Rust core knows nothing about
 ;;; Postgres — the package sits on the same editor primitives magit / macros-k8s
 ;;; use:
-;;;   * `call-process-full` — run psql, capture stdout/stderr (catalog queries)
-;;;   * lib-async (`async-lane-run`) — run user queries WITHOUT freezing the UI,
-;;;     cancellable with C-g
+;;;   * lib-async (`async-lane-run`) — run the catalog queries behind every view
+;;;     and the user's own queries WITHOUT freezing the UI, cancellable with C-g
+;;;   * `call-process-full` — the few synchronous runs (org-babel, the first
+;;;     completion catalog fetch)
 ;;;   * lib-section (`section-open`/`section-line`/`section-render`) — foldable,
 ;;;     navigable read-only buffers
 ;;;   * `render-buffer` — the results / error buffers
@@ -29,11 +30,15 @@
 ;;;                           ^ goes up to the schema; v previews rows.
 ;;;   *psql-query*            an editable sql-mode buffer in a half-height pane
 ;;;                           (`s` from any dashboard buffer, or M-x psql-query).
-;;;                           C-c C-c runs the buffer's SQL asynchronously;
+;;;                           C-c C-c runs the region, else the statement at
+;;;                           point, asynchronously; C-c C-b the whole buffer;
+;;;                           C-c C-e / C-c C-a EXPLAIN / EXPLAIN ANALYZE it.
 ;;;                           C-g cancels a running query; C-c C-k closes it.
 ;;;                           `up` in the empty pane (or M-p) recalls history.
 ;;;   psql-result.csv         the query output as a grid (errors / no rows →
 ;;;                           results.org instead).
+;;;   *psql-explain*          a query plan as a foldable tree, with each node's
+;;;                           own time and misestimated row counts flagged.
 ;;;
 ;;; Conventions (matching macros-k8s / macros-jj):
 ;;;   * public commands are `psql-…`, private helpers `psql--…`
@@ -120,7 +125,13 @@
    'samples     '() ; ((ms xacts blks-hit blks-read active) …), oldest first
    'auto        #f  ; auto-refresh on?
    'timer-armed #f  ; is a tick scheduled?
-   'quiet       #f  ; rendering from a tick (skip the catalog refresh)
+   ;; background view fetches (see the background fetches section)
+   'view-job    #f  ; (specs quiet k) of the fetch in flight
+   'view-queued #f  ; (specs quiet k) to start when it lands (newest wins)
+   'built       ""  ; the buffer lib-section's fold records belong to
+   'pending-toggle #f ; buffer whose TAB waits on its redraw
+   'loading     #f  ; an "opening …" message is up, to clear on arrival
+   'cat-url     ""  ; the URL an in-flight catalog fetch is for
    'pending-msg ""  ; echo-area summary shown after a results file opens
    'back        '() ; buffer -> the psql buffer RET opened it from (for q)
    'grid-widths '() ; column widths (chars) for the result grid being opened
@@ -130,6 +141,10 @@
    'hist-shown  ""  ; the text that entry put in the buffer
    ;; psql variables (see the query variables section)
    'vars        '() ; name -> last value given for a :'name' reference
+   ;; EXPLAIN (see the EXPLAIN section)
+   'plan-req    #f  ; (analyze? statement) of the explain in flight
+   'plan        #f  ; (analyze? statement lines run) of *psql-explain*
+   'plan-run    0   ; bumps per plan, so fold state doesn't leak between plans
    ))
 (define (psql--st key) (hash-try-get psql-state key))
 (define (psql--st! key val) (set! psql-state (hash-insert psql-state key val)))
@@ -240,20 +255,6 @@
                        (if (psql--blank? stderr) "psql failed (no output)" (trim-end stderr)) '())
         (message "psql failed — see *psql-error*"))))
 
-;; Run `sql`, parse unaligned tuples into rows of exactly `ncols` fields.
-;; → a list of rows, or #f after surfacing the error (callers abort on #f).
-(define (psql--query sql ncols)
-  (let ((r (psql--run-full (append (psql--conn)
-                                   (list "-X" "-q" "-A" "-t" "-P" "pager=off" "-c" sql)))))
-    (if (equal? (car r) "0")
-        (map (lambda (ln) (psql--fields-n ln ncols)) (psql--lines (nth r 1)))
-        (begin (psql--error (car r) (nth r 2)) #f))))
-;; Raw stdout of `sql` (for multi-line single values like a view definition).
-(define (psql--raw sql)
-  (let ((r (psql--run-full (append (psql--conn)
-                                   (list "-X" "-q" "-A" "-t" "-P" "pager=off" "-c" sql)))))
-    (if (equal? (car r) "0") (trim-end (nth r 1)) #f)))
-
 ;; A scalar subselect resolving schema.table to its pg_class oid — safer than
 ;; ::regclass (no identifier-quoting games; names embed as escaped literals).
 (define (psql--reloid s t)
@@ -322,24 +323,141 @@
           ((equal? (car ls) psql--sep) (loop (cdr ls) '() (cons (reverse cur) groups)))
           (else (loop (cdr ls) (cons (car ls) cur) groups)))))
 
-;; `specs` = ((sql ncols) …) → (rows-per-query error-lines), or #f after
-;; surfacing a failure to run psql / connect at all.
-(define (psql--batch specs)
-  (let ((r (psql--run-full (append (psql--conn)
-                                   (list "-X" "-q" "-A" "-t" "-P" "pager=off")
-                                   (psql--batch-args specs)))))
-    (if (not (equal? (car r) "0"))
-        (begin (psql--error (car r) (nth r 2)) #f)
-        (let ((groups (psql--split-batch (psql--lines (nth r 1)))))
-          (list (let loop ((ss specs) (gs groups) (acc '()))
-                  (if (null? ss)
-                      (reverse acc)
-                      (loop (cdr ss) (if (null? gs) '() (cdr gs))
-                            (cons (map (lambda (ln) (psql--fields-n ln (cadr (car ss))))
-                                       (if (null? gs) '() (car gs)))
-                                  acc))))
-                (filter (lambda (l) (starts-with? l "ERROR:"))
-                        (split-many (nth r 2) "\n")))))))
+;; A finished batch's exit code / stdout / stderr → (rows-per-query
+;; error-lines), or #f after surfacing a failure to run psql / connect at all
+;; (`quiet` = only say so in the echo area — an auto-refresh tick must not pop
+;; an error buffer over whatever you're doing).
+(define (psql--batch-parse specs code out err quiet)
+  (cond
+   ((not (equal? code "0"))
+    (if quiet
+        (message (if (psql--not-found? code)
+                     (psql--not-found-msg)
+                     (string-append "psql: refresh failed — "
+                                    (psql--nth-or (psql--lines err) 0 "no output"))))
+        (psql--error code err))
+    #f)
+   (else
+    (let ((groups (psql--split-batch (psql--lines out))))
+      (list (let loop ((ss specs) (gs groups) (acc '()))
+              (if (null? ss)
+                  (reverse acc)
+                  (loop (cdr ss) (if (null? gs) '() (cdr gs))
+                        (cons (map (lambda (ln) (psql--fields-n ln (cadr (car ss))))
+                                   (if (null? gs) '() (car gs)))
+                              acc))))
+            (filter (lambda (l) (starts-with? l "ERROR:"))
+                    (split-many err "\n")))))))
+
+;; ── background fetches ────────────────────────────────────────────────────────
+;; Every view's catalog batch runs in the BACKGROUND (make-process on a lib-async
+;; lane), so a slow or far-away server never freezes the editor: RET, r, ^ and
+;; auto-refresh return at once, and the view draws when psql exits. psql writes
+;; to temp files (make-process would otherwise call back once per LINE), read
+;; back in the exit callback — the k8s-dashboard pattern. PGCONNECT_TIMEOUT
+;; (default 10s, unless you set your own) keeps an unreachable host from
+;; holding the lane forever; C-g in a dashboard buffer cancels.
+;;
+;; One view fetch runs at a time. Asking for another while one is in flight
+;; QUEUES it (the newest request replaces an older queued one), and it starts
+;; when the current one lands — so mashing r costs one extra round trip, not N.
+;; The trailing `echo` is load-bearing: the editor republishes the current
+;; buffer before each OUTPUT callback but not before the exit callback, so
+;; without one stdout line the exit callback's (current-buffer) can be stale —
+;; e.g. still the buffer you left by opening the dashboard.
+(define psql--fetch-script
+  (string-append
+   ": \"${PGCONNECT_TIMEOUT:=10}\"; export PGCONNECT_TIMEOUT;"
+   " out=$1; shift; mkdir -p \"${out%/*}\"; \"$@\" >\"$out\" 2>\"$out.err\";"
+   " code=$?; echo; exit $code"))
+(define (psql--fetch-path lane)
+  (string-append (psql--tmpdir) "/macros-psql/fetch-" lane))
+(define psql--tuples-flags (list "-X" "-q" "-A" "-t" "-P" "pager=off"))
+(define (psql--spawn lane psql-args on-exit)
+  (async-lane-run lane "/bin/sh"
+                  (append (list "-c" psql--fetch-script "sh" (psql--fetch-path lane)
+                                (psql--command))
+                          psql-args)
+                  'psql--noop on-exit))
+(define (psql--noop line) #f)
+;; The finished fetch's (stdout stderr).
+(define (psql--fetched lane)
+  (let ((p (psql--fetch-path lane)))
+    (list (if (file-exists? p) (read-file p) "")
+          (if (file-exists? (string-append p ".err")) (read-file (string-append p ".err")) ""))))
+
+;; Run the batch `specs` (see psql--batch-args) in the background, then call
+;; (k result) with psql--batch-parse's result. `quiet` = an auto-refresh tick.
+(define (psql--fetch specs quiet k)
+  (if (async-lane-live? "psql-view")
+      (psql--st! 'view-queued (list specs quiet k))
+      (psql--fetch-start specs quiet k)))
+(define (psql--fetch-start specs quiet k)
+  (psql--st! 'view-job (list specs quiet k))
+  (psql--spawn "psql-view" (append (psql--conn) psql--tuples-flags (psql--batch-args specs))
+               'psql--fetch-exit))
+(define (psql--fetch-exit code)
+  (let ((cancelled (async-lane-finish "psql-view"))
+        (job (psql--st 'view-job)))
+    (psql--st! 'view-job #f)
+    (if cancelled
+        (begin (psql--st! 'view-queued #f)
+               (message "psql: refresh cancelled"))
+        (when job
+          (let* ((io (psql--fetched "psql-view"))
+                 (res (psql--batch-parse (car job) code (car io) (cadr io) (cadr job))))
+            ;; a drawing bug must not wedge the queue behind it
+            (when res
+              (with-handler
+               (lambda (e) (message (string-append "psql: " (error-object-message e))))
+               ((nth job 2) res))))))
+    (let ((q (psql--st 'view-queued)))
+      (when q
+        (psql--st! 'view-queued #f)
+        (psql--fetch-start (car q) (cadr q) (nth q 2))))))
+(define (psql--fetching?) (async-lane-live? "psql-view"))
+
+;; C-g in a dashboard buffer: cancel an in-flight refresh, else keyboard-quit.
+(define-command (psql-cancel) (async-lane-quit "psql-view"))
+
+;; ── drawing a fetched view ────────────────────────────────────────────────────
+;; A view's data lands after you pressed the key, maybe after you moved on. So
+;; the drawer picks how to show it, decided BEFORE building (the build rewrites
+;; the buffer's line map, which must match the text actually on screen):
+;;   "show"  — you're still in the target buffer, or still waiting where you
+;;             pressed RET: draw it and switch there (point kept on a refresh).
+;;   "quiet" — you've gone elsewhere: redraw the buffer in place, no focus
+;;             change (folds/accents re-apply when you next TAB or refresh).
+;;   #f      — an auto-refresh tick and the dashboard isn't in front: drop it.
+(define (psql--draw-mode buf origin quiet)
+  (cond ((equal? (current-buffer) buf) "show")
+        (quiet #f)
+        ((equal? (current-buffer) origin) "show")
+        (else "quiet")))
+;; Finish a build started under `mode` (see above).
+(define (psql--present! buf mode)
+  (if (equal? mode "show")
+      (let ((line (if (equal? (current-buffer) buf) (buffer-line) 0)))
+        (section-render buf "psql-mode")
+        (goto-line line)
+        (psql--st! 'built buf)
+        (when (psql--st 'loading)            ; clear "opening …"
+          (psql--st! 'loading #f)
+          (message ""))
+        (psql--pending-toggle! buf))
+      (begin
+        (render-buffer-quiet buf "psql-mode" (section-text) (section-line-faces))
+        (psql--st! 'built buf)
+        (message (string-append "psql: " buf " updated in the background")))))
+
+;; lib-section's fold records belong to the LAST build, whichever buffer that
+;; was — so after the dashboard redraws, TAB in a table buffer would fold by the
+;; dashboard's sections. TAB in a buffer that isn't the last build refreshes it
+;; first, and the fold happens when the redraw lands.
+(define (psql--pending-toggle! buf)
+  (when (equal? (psql--st 'pending-toggle) buf)
+    (psql--st! 'pending-toggle #f)
+    (section-toggle-at-point)))
 
 ;; ── display helpers ───────────────────────────────────────────────────────────
 (define (psql--2d n) (if (< n 10) (string-append "0" (number->string n)) (number->string n)))
@@ -761,28 +879,48 @@
     (section-close (string-append "psql/" s))
     (section-line "" #f)))
 
-(define (psql--render-dashboard)
-  (let ((res (psql--batch (list (list psql--meta-sql 7) (list psql--dbstats-sql 7)
-                                (list psql--conns-sql 4) (list psql--tables-sql 5)
-                                (list psql--schemas-sql 2) (list psql--activity-sql 7)
-                                (list psql--attention-sql 5) (list psql--pgss-sql 5)))))
-    (when res   ; #f = couldn't run psql / connect, already surfaced
-      (let* ((qs (car res))
-             ;; pg_stat_statements missing is expected, not an error
-             (errs (filter (lambda (e) (not (string-contains? e "pg_stat_statements"))) (cadr res)))
-             (meta (nth qs 0)))
-        (if (null? meta)
-            (psql--error "1" (string-join (cadr res) "\n"))
-            (let* ((m (car meta))
-                   (db (if (null? (nth qs 1)) '() (car (nth qs 1))))
-                   (c (if (null? (nth qs 2)) (list "?" "?" "?" "?") (car (nth qs 2))))
-                   (tabs (nth qs 3))
-                   (act (nth qs 5))
-                   (line (if (equal? (current-buffer) "*psql-dashboard*") (buffer-line) 0)))
-              (unless (null? db)
-                (psql--sample! (list (psql--num (nth db 0)) (psql--num (nth db 1))
-                                     (psql--num (nth db 2)) (psql--num (nth db 3))
-                                     (psql--num (psql--nth-or c 1 "0")))))
+;; Fetch the dashboard in the background, then draw it. `origin` is the buffer
+;; the request came from; `quiet` marks an auto-refresh tick (see
+;; psql--draw-mode for what each means once the data lands).
+(define (psql--load-dashboard origin quiet)
+  (psql--fetch (list (list psql--meta-sql 7) (list psql--dbstats-sql 7)
+                     (list psql--conns-sql 4) (list psql--tables-sql 5)
+                     (list psql--schemas-sql 2) (list psql--activity-sql 7)
+                     (list psql--attention-sql 5) (list psql--pgss-sql 5))
+               quiet
+               (lambda (res) (psql--draw-dashboard res origin quiet))))
+
+;; First open: a placeholder right away, so the key visibly did something while
+;; the first fetch is out.
+(define (psql--dashboard-placeholder)
+  (psql--lm-begin! "*psql-dashboard*")
+  (psql--view-set! "*psql-dashboard*" (list "dashboard"))
+  (section-begin)
+  (section-line (string-append "Connecting to " (psql--display-url) " …") "psql-header")
+  (psql--emit-hint "C-g cancels · q quits")
+  (section-render "*psql-dashboard*" "psql-mode")
+  (psql--st! 'built "*psql-dashboard*"))
+
+(define (psql--draw-dashboard res origin quiet)
+  (let* ((qs (car res))
+         ;; pg_stat_statements missing is expected, not an error
+         (errs (filter (lambda (e) (not (string-contains? e "pg_stat_statements"))) (cadr res)))
+         (meta (nth qs 0)))
+    (if (null? meta)
+        (if quiet
+            (message (string-append "psql: refresh failed — " (psql--nth-or (cadr res) 0 "no rows")))
+            (psql--error "1" (string-join (cadr res) "\n")))
+        (let* ((m (car meta))
+               (db (if (null? (nth qs 1)) '() (car (nth qs 1))))
+               (c (if (null? (nth qs 2)) (list "?" "?" "?" "?") (car (nth qs 2))))
+               (tabs (nth qs 3))
+               (act (nth qs 5))
+               (mode (psql--draw-mode "*psql-dashboard*" origin quiet)))
+          (unless (null? db)
+            (psql--sample! (list (psql--num (nth db 0)) (psql--num (nth db 1))
+                                 (psql--num (nth db 2)) (psql--num (nth db 3))
+                                 (psql--num (psql--nth-or c 1 "0")))))
+          (when mode
               (psql--lm-begin! "*psql-dashboard*")
               (psql--view-set! "*psql-dashboard*" (list "dashboard"))
               (section-begin)
@@ -812,79 +950,80 @@
                                     (filter (lambda (r) (equal? (psql--nth-or r 0 "") s)) tabs))))
                    (psql--emit-schema s owner rows)))
                (nth qs 4))
-              (section-render "*psql-dashboard*" "psql-mode")
-              (goto-line line)
-              ;; piggy-back: refresh the SQL completion catalog — but not on
-              ;; every auto-refresh tick (it's a whole pg_attribute scan)
-              (unless (psql--st 'quiet) (psql--catalog-refresh!))))))))
+              (psql--present! "*psql-dashboard*" mode))
+          ;; piggy-back: refresh the SQL completion catalog — but not on every
+          ;; auto-refresh tick (it's a whole pg_attribute scan)
+          (unless quiet (psql--catalog-refresh-async!))))))
 
 ;; ── schema buffer ─────────────────────────────────────────────────────────────
 (define (psql--schema-buffer s) (string-append "*psql-schema:" s "*"))
 
-(define (psql--render-schema s)
-  (let* ((sq (psql--sq s))
-         (res (psql--batch
-               (list
-                (list (string-append "select pg_get_userbyid(n.nspowner),"
-                                     " regexp_replace(coalesce(obj_description(n.oid,'pg_namespace'),''), '\\s+', ' ', 'g')"
-                                     " from pg_namespace n where n.nspname = '" sq "'") 2)
-                (list (string-append
-                       "select c.relkind, c.reltuples::bigint, pg_total_relation_size(c.oid),"
-                       " pg_table_size(c.oid), pg_indexes_size(c.oid),"
-                       " coalesce((st.n_dead_tup * 100 / nullif(st.n_live_tup + st.n_dead_tup, 0))::text, ''),"
-                       " c.relname"
-                       " from pg_class c join pg_namespace n on n.oid = c.relnamespace"
-                       " left join pg_stat_all_tables st on st.relid = c.oid"
-                       " where n.nspname = '" sq "' and c.relkind in ('r','p','m','v','f')"
-                       " order by pg_total_relation_size(c.oid) desc, c.relname") 7)))))
-    (when res
-      (let ((info (car (car res))) (tabs (cadr (car res))))
-        (if (null? info)
-            (message (string-append "psql: no such schema — " s))
-            (let* ((buf   (psql--schema-buffer s))
-                   (owner (psql--nth-or (car info) 0 ""))
-                   (desc  (psql--nth-or (car info) 1 ""))
-                   (rows  (map (lambda (r) (list (psql--nth-or r 0 "")
-                                                 (psql--num (psql--nth-or r 1 "-1"))
-                                                 (psql--num (psql--nth-or r 2 "0"))
-                                                 (psql--num (psql--nth-or r 3 "0"))
-                                                 (psql--num (psql--nth-or r 4 "0"))
-                                                 (psql--nth-or r 5 "")
-                                                 (psql--nth-or r 6 "")))
-                               tabs))
-                   (mx (psql--max-of (map (lambda (r) (nth r 2)) rows)))
-                   (line (if (equal? (current-buffer) buf) (buffer-line) 0)))
-              (psql--lm-begin! buf)
-              (psql--view-set! buf (list "schema" s))
-              (section-begin)
-              (section-line (string-append "Schema: " s "   Owner: " owner "   "
-                                           (number->string (length rows)) " relations · "
-                                           (psql--human (psql--sum (map (lambda (r) (nth r 2)) rows))))
-                            "psql-header")
-              (when (not (equal? desc "")) (section-line desc "psql-dim"))
-              (psql--emit-hint "RET/g table info · v preview rows · ^ dashboard · r refresh · s query · Y copy · q quit")
-              (section-open (string-append "psql-relations/" s) "Relations" "psql-section")
-              (if (null? rows)
-                  (section-line "    (no relations)" "psql-dim")
-                  (psql--emit-rows
-                   (list "NAME" "TYPE" "~ROWS" "TOTAL" "TABLE" "INDEXES" "DEAD" "")
-                   rows
-                   (lambda (r)
-                     (if (psql--sizeless? (nth r 0))
-                         (list (nth r 6) (psql--kind (nth r 0)) "-" "-" "-" "-" "" "")
-                         (list (nth r 6) (psql--kind (nth r 0)) (psql--rows-h (nth r 1))
-                               (psql--human (nth r 2)) (psql--human (nth r 3))
-                               (psql--human (nth r 4))
-                               (if (equal? (nth r 5) "")
-                                   ""
-                                   (list (string-append (nth r 5) "%")
-                                         (if (>= (psql--num (nth r 5)) 20) "psql-warn" #f)))
-                               (list (psql--bar (nth r 2) mx 16) "psql-bar"))))
-                   (lambda (r) (psql--record "table" s (nth r 6)))
-                   #f))
-              (section-close (string-append "psql-relations/" s))
-              (section-render buf "psql-mode")
-              (goto-line line)))))))
+(define (psql--load-schema s origin)
+  (let ((sq (psql--sq s)))
+    (psql--fetch
+     (list
+      (list (string-append "select pg_get_userbyid(n.nspowner),"
+                           " regexp_replace(coalesce(obj_description(n.oid,'pg_namespace'),''), '\\s+', ' ', 'g')"
+                           " from pg_namespace n where n.nspname = '" sq "'") 2)
+      (list (string-append
+             "select c.relkind, c.reltuples::bigint, pg_total_relation_size(c.oid),"
+             " pg_table_size(c.oid), pg_indexes_size(c.oid),"
+             " coalesce((st.n_dead_tup * 100 / nullif(st.n_live_tup + st.n_dead_tup, 0))::text, ''),"
+             " c.relname"
+             " from pg_class c join pg_namespace n on n.oid = c.relnamespace"
+             " left join pg_stat_all_tables st on st.relid = c.oid"
+             " where n.nspname = '" sq "' and c.relkind in ('r','p','m','v','f')"
+             " order by pg_total_relation_size(c.oid) desc, c.relname") 7))
+     #f
+     (lambda (res) (psql--draw-schema s res origin)))))
+
+(define (psql--draw-schema s res origin)
+  (let ((info (car (car res))) (tabs (cadr (car res)))
+        (mode (psql--draw-mode (psql--schema-buffer s) origin #f)))
+    (if (null? info)
+        (message (string-append "psql: no such schema — " s))
+        (let* ((buf   (psql--schema-buffer s))
+               (owner (psql--nth-or (car info) 0 ""))
+               (desc  (psql--nth-or (car info) 1 ""))
+               (rows  (map (lambda (r) (list (psql--nth-or r 0 "")
+                                             (psql--num (psql--nth-or r 1 "-1"))
+                                             (psql--num (psql--nth-or r 2 "0"))
+                                             (psql--num (psql--nth-or r 3 "0"))
+                                             (psql--num (psql--nth-or r 4 "0"))
+                                             (psql--nth-or r 5 "")
+                                             (psql--nth-or r 6 "")))
+                           tabs))
+               (mx (psql--max-of (map (lambda (r) (nth r 2)) rows))))
+          (psql--lm-begin! buf)
+          (psql--view-set! buf (list "schema" s))
+          (section-begin)
+          (section-line (string-append "Schema: " s "   Owner: " owner "   "
+                                       (number->string (length rows)) " relations · "
+                                       (psql--human (psql--sum (map (lambda (r) (nth r 2)) rows))))
+                        "psql-header")
+          (when (not (equal? desc "")) (section-line desc "psql-dim"))
+          (psql--emit-hint "RET/g table info · v preview rows · ^ dashboard · r refresh · s query · Y copy · q quit")
+          (section-open (string-append "psql-relations/" s) "Relations" "psql-section")
+          (if (null? rows)
+              (section-line "    (no relations)" "psql-dim")
+              (psql--emit-rows
+               (list "NAME" "TYPE" "~ROWS" "TOTAL" "TABLE" "INDEXES" "DEAD" "")
+               rows
+               (lambda (r)
+                 (if (psql--sizeless? (nth r 0))
+                     (list (nth r 6) (psql--kind (nth r 0)) "-" "-" "-" "-" "" "")
+                     (list (nth r 6) (psql--kind (nth r 0)) (psql--rows-h (nth r 1))
+                           (psql--human (nth r 2)) (psql--human (nth r 3))
+                           (psql--human (nth r 4))
+                           (if (equal? (nth r 5) "")
+                               ""
+                               (list (string-append (nth r 5) "%")
+                                     (if (>= (psql--num (nth r 5)) 20) "psql-warn" #f)))
+                           (list (psql--bar (nth r 2) mx 16) "psql-bar"))))
+               (lambda (r) (psql--record "table" s (nth r 6)))
+               #f))
+          (section-close (string-append "psql-relations/" s))
+          (psql--present! buf mode)))))
 
 ;; ── table buffer ──────────────────────────────────────────────────────────────
 (define (psql--table-buffer s t) (string-append "*psql-table:" s "." t "*"))
@@ -973,7 +1112,11 @@
           " from pg_constraint con join pg_class c on c.oid = con.conrelid"
           " join pg_namespace n on n.oid = c.relnamespace"
           " where con.confrelid = " oid " and con.contype = 'f'"
-          " order by n.nspname, c.relname, con.conname") 4)))
+          " order by n.nspname, c.relname, con.conname") 4)
+   ;; 7 view / matview definition, one row per line (none for other kinds)
+   (list (string-append
+          "select pg_get_viewdef(c.oid, true) from pg_class c"
+          " where c.oid = " oid " and c.relkind in ('v','m')") 1)))
 
 ;; Sections are keyed per table, so folding Columns in one table doesn't fold
 ;; it in every other table too.
@@ -1100,70 +1243,76 @@
                        #f))
   (section-close (psql--tsec s t "refby")))
 
-(define (psql--render-table s t)
-  (let* ((oid (psql--reloid s t))
-         (res (psql--batch (psql--table-specs oid))))
-    (when res
-      (let ((qs (car res)))
-        (if (null? (nth qs 0))
-            (message (string-append "psql: no such relation — " s "." t))
-            (let* ((o     (car (nth qs 0)))
-                   (kind  (psql--nth-or o 0 ""))
-                   (buf   (psql--table-buffer s t))
-                   (st    (if (null? (nth qs 1)) '() (car (nth qs 1))))
-                   (io    (if (null? (nth qs 2)) '() (car (nth qs 2))))
-                   (desc  (psql--nth-or o 7 ""))
-                   (line  (if (equal? (current-buffer) buf) (buffer-line) 0)))
-              (psql--lm-begin! buf)
-              (psql--view-set! buf (list "table" s t))
-              (section-begin)
-              (section-line (string-append (psql--kind kind) ": " s "." t
-                                           "   Owner: " (psql--nth-or o 1 "?")
-                                           "   ~" (psql--rows-h (psql--num (psql--nth-or o 2 "-1"))) " rows"
-                                           "   Total: " (psql--human (psql--num (psql--nth-or o 3 "0"))))
-                            "psql-header")
-              (unless (equal? desc "") (section-line desc "psql-dim"))
-              (psql--emit-hint "^ up to schema · RET follow foreign key · v preview rows · r refresh · s query · q quit")
-              (unless (psql--sizeless? kind)
-                (section-open (psql--tsec s t "size") "Size" "psql-section")
-                (psql--emit-table-size o)
-                (section-close (psql--tsec s t "size"))
-                (section-line "" #f))
-              (unless (null? st)
-                (section-open (psql--tsec s t "stats") "Stats" "psql-section")
-                (psql--emit-table-stats st io)
-                (section-close (psql--tsec s t "stats"))
-                (section-line "" #f))
-              (psql--emit-columns s t (nth qs 3))
-              (psql--emit-indexes s t (nth qs 4))
-              (psql--emit-constraints s t (nth qs 5))
-              (psql--emit-referenced-by s t (nth qs 6))
-              ;; view definition
-              (when (member kind (list "v" "m"))
-                (section-line "" #f)
-                (section-open (psql--tsec s t "viewdef") "Definition" "psql-section")
-                (let ((def (psql--raw (string-append "select pg_get_viewdef(" oid ", true)"))))
-                  (if (or (not def) (equal? def ""))
-                      (section-line "    (unavailable)" "psql-dim")
-                      (for-each (lambda (l) (section-line (string-append "    " l) #f))
-                                (split-many def "\n"))))
-                (section-close (psql--tsec s t "viewdef")))
-              (section-render buf "psql-mode")
-              (goto-line line)))))))
+(define (psql--load-table s t origin)
+  (psql--fetch (psql--table-specs (psql--reloid s t)) #f
+               (lambda (res) (psql--draw-table s t res origin))))
+
+(define (psql--draw-table s t res origin)
+  (let ((qs (car res))
+        (mode (psql--draw-mode (psql--table-buffer s t) origin #f)))
+    (if (null? (nth qs 0))
+        (message (string-append "psql: no such relation — " s "." t))
+        (let* ((o     (car (nth qs 0)))
+               (kind  (psql--nth-or o 0 ""))
+               (buf   (psql--table-buffer s t))
+               (st    (if (null? (nth qs 1)) '() (car (nth qs 1))))
+               (io    (if (null? (nth qs 2)) '() (car (nth qs 2))))
+               (desc  (psql--nth-or o 7 "")))
+          (psql--lm-begin! buf)
+          (psql--view-set! buf (list "table" s t))
+          (section-begin)
+          (section-line (string-append (psql--kind kind) ": " s "." t
+                                       "   Owner: " (psql--nth-or o 1 "?")
+                                       "   ~" (psql--rows-h (psql--num (psql--nth-or o 2 "-1"))) " rows"
+                                       "   Total: " (psql--human (psql--num (psql--nth-or o 3 "0"))))
+                        "psql-header")
+          (unless (equal? desc "") (section-line desc "psql-dim"))
+          (psql--emit-hint "^ up to schema · RET follow foreign key · v preview rows · r refresh · s query · q quit")
+          (unless (psql--sizeless? kind)
+            (section-open (psql--tsec s t "size") "Size" "psql-section")
+            (psql--emit-table-size o)
+            (section-close (psql--tsec s t "size"))
+            (section-line "" #f))
+          (unless (null? st)
+            (section-open (psql--tsec s t "stats") "Stats" "psql-section")
+            (psql--emit-table-stats st io)
+            (section-close (psql--tsec s t "stats"))
+            (section-line "" #f))
+          (psql--emit-columns s t (nth qs 3))
+          (psql--emit-indexes s t (nth qs 4))
+          (psql--emit-constraints s t (nth qs 5))
+          (psql--emit-referenced-by s t (nth qs 6))
+          ;; view definition
+          (when (member kind (list "v" "m"))
+            (section-line "" #f)
+            (section-open (psql--tsec s t "viewdef") "Definition" "psql-section")
+            (if (null? (nth qs 7))
+                (section-line "    (unavailable)" "psql-dim")
+                (for-each (lambda (r) (section-line (string-append "    " (car r)) #f))
+                          (nth qs 7)))
+            (section-close (psql--tsec s t "viewdef")))
+          (psql--present! buf mode)))))
 
 ;; ── entry / navigation commands ───────────────────────────────────────────────
-(define-command (psql-dashboard) (psql--with-url psql--render-dashboard))
+(define-command (psql-dashboard)
+  (psql--with-url
+    (lambda ()
+      (if (member "*psql-dashboard*" (buffer-names))
+          (switch-to-buffer "*psql-dashboard*")
+          (psql--dashboard-placeholder))
+      (psql--load-dashboard "*psql-dashboard*" #f))))
 
-;; Refresh whatever psql buffer we're in.
+;; Refresh whatever psql buffer we're in (in the background — it redraws in
+;; place when the data lands).
 (define-command (psql-refresh)
-  (let ((v (psql--view (current-buffer))))
+  (let ((v (psql--view (current-buffer))) (here (current-buffer)))
     (if (not v)
         (message "psql: not a psql buffer")
         (psql--with-url
           (lambda ()
-            (cond ((equal? (car v) "dashboard") (psql--render-dashboard))
-                  ((equal? (car v) "schema")    (psql--render-schema (nth v 1)))
-                  ((equal? (car v) "table")     (psql--render-table (nth v 1) (nth v 2)))))))))
+            (cond ((equal? (car v) "dashboard") (psql--load-dashboard here #f))
+                  ((equal? (car v) "schema")    (psql--load-schema (nth v 1) here))
+                  ((equal? (car v) "table")     (psql--load-table (nth v 1) (nth v 2) here))))))))
 
 ;; RET / g: drill into the thing at point (schema heading → schema buffer,
 ;; table row → table buffer). TAB folds instead — magit muscle memory.
@@ -1177,10 +1326,14 @@
           (lambda ()
             (cond ((equal? (nth e 1) "schema")
                    (psql--set-back! (psql--schema-buffer (nth e 2)) from)
-                   (psql--render-schema (nth e 2)))
+                   (psql--st! 'loading #t)
+                   (message (string-append "psql: opening " (nth e 2) " …"))
+                   (psql--load-schema (nth e 2) from))
                   ((equal? (nth e 1) "table")
                    (psql--set-back! (psql--table-buffer (nth e 2) (nth e 3)) from)
-                   (psql--render-table (nth e 2) (nth e 3)))))))))
+                   (psql--st! 'loading #t)
+                   (message (string-append "psql: opening " (nth e 2) "." (nth e 3) " …"))
+                   (psql--load-table (nth e 2) (nth e 3) from))))))))
 
 (define (psql--set-back! buf from)
   (unless (equal? buf from)
@@ -1199,11 +1352,23 @@
 (define-command (psql-up)
   (let ((v (psql--view (current-buffer))))
     (cond ((and v (equal? (car v) "table"))
-           (psql--with-url (lambda () (psql--render-schema (nth v 1)))))
-          ((and v (equal? (car v) "schema")) (psql--with-url psql--render-dashboard))
+           (psql--with-url (lambda () (psql--load-schema (nth v 1) (current-buffer)))))
+          ((and v (equal? (car v) "schema"))
+           (psql--with-url (lambda () (psql--load-dashboard (current-buffer) #f))))
           (else (message "psql: already at the top")))))
 
-(define-command (psql-toggle-fold) (section-toggle-at-point))
+;; TAB. The fold records are the last build's (see psql--pending-toggle!): in
+;; any other psql view, rebuild it first and fold once the redraw lands.
+(define-command (psql-toggle-fold)
+  (let ((buf (current-buffer)))
+    (cond ((equal? (psql--st 'built) buf) (section-toggle-at-point))
+          ((psql--view buf)
+           (psql--st! 'pending-toggle buf)
+           (psql-refresh))
+          ((equal? buf "*psql-explain*")
+           (psql--explain-draw! (psql--st 'plan))
+           (section-toggle-at-point))
+          (else (section-toggle-at-point)))))
 
 ;; v: the first rows of the table at point (or of this table buffer), as a grid.
 (define (psql--ident x) (string-append "\"" (string-join (split-many x "\"") "\"\"") "\""))
@@ -1223,11 +1388,12 @@
                                           (number->string (psql--preview-rows)) ";")))))))
 
 ;; ── auto-refresh ──────────────────────────────────────────────────────────────
-;; One self-rearming timer (the k8s-dashboard pattern). A tick re-renders the
-;; dashboard only while it's the buffer in front — renders are synchronous, so
-;; a background tick would steal focus — and the chain stops once auto-refresh
-;; is off or the dashboard is gone. Interval: the "psql-auto-refresh" option,
-;; in seconds (default 10).
+;; One self-rearming timer (the k8s-dashboard pattern). A tick fetches only
+;; while the dashboard is the buffer in front and no other fetch is out, and
+;; the redraw is dropped if you've left the dashboard by the time it lands —
+;; so a tick never steals focus or redraws a buffer you aren't looking at. The
+;; chain stops once auto-refresh is off or the dashboard is gone. Interval: the
+;; "psql-auto-refresh" option, in seconds (default 10).
 (define (psql--auto-ms) (* 1000 (max 2 (psql--option-num "psql-auto-refresh" 10))))
 (define (psql--arm-timer)
   (when (not (psql--st 'timer-armed))
@@ -1236,10 +1402,9 @@
 (define-command (psql--tick)
   (psql--st! 'timer-armed #f)
   (when (and (psql--st 'auto) (member "*psql-dashboard*" (buffer-names)))
-    (when (and (equal? (current-buffer) "*psql-dashboard*") (not (psql--url-pending?)))
-      (psql--st! 'quiet #t)
-      (psql--render-dashboard)
-      (psql--st! 'quiet #f))
+    (when (and (equal? (current-buffer) "*psql-dashboard*") (not (psql--url-pending?))
+               (not (psql--fetching?)))
+      (psql--load-dashboard "*psql-dashboard*" #t))
     (psql--arm-timer)))
 (define-command (psql-toggle-auto)
   (psql--st! 'auto (not (psql--st 'auto)))
@@ -1287,9 +1452,9 @@
 ;; ── the query pane ────────────────────────────────────────────────────────────
 ;; `s` (or M-x psql-query) opens *psql-query* in a half-height pane below, in
 ;; real sql-mode (tree-sitter highlighting, every editing keymap). C-c C-c runs
-;; the buffer's SQL asynchronously against the configured URL; results land in
-;; *psql-results* (psql's own aligned output + \timing). C-g cancels a running
-;; query, C-c C-k closes the pane.
+;; the region or the statement at point asynchronously against the configured
+;; URL (C-c C-b the whole buffer); results open as a grid (or results.org).
+;; C-g cancels a running query, C-c C-k closes the pane.
 (define (psql--tmpdir)
   (let ((t (getenv "TMPDIR")))
     (cond ((equal? t "") "/tmp")
@@ -1331,20 +1496,140 @@
               (begin
                 (append-to-buffer "*psql-query*" "")
                 (set-major-mode "sql")))))
-    (message "SQL — C-c C-c runs the buffer · C-g cancels a running query · C-c C-k closes")))
+    (message "SQL — C-c C-c runs the statement at point · C-c C-b the buffer · C-c C-e explains · C-c C-k closes")))
 
-;; C-c C-c in ANY sql-mode buffer: run the whole buffer's SQL. Async via
+;; Run `sql` through the pane's flow: save it to history (query pane only),
+;; read any unset psql variables, then hand it to `run` with them.
+(define (psql--run-flow sql history-text run)
+  (psql--with-url (lambda ()
+                    (when (equal? (current-buffer) "*psql-query*")
+                      (psql--history-add! history-text))
+                    (psql--read-vars (psql--unset-vars sql) '() run))))
+
+;; C-c C-b in ANY sql-mode buffer: run the whole buffer's SQL. Async via
 ;; lib-async so a slow query never freezes the editor; `2>&1` interleaves
 ;; errors/notices with the output in statement order.
 (define-command (psql-run-buffer)
   (let ((sql (buffer-string)))
     (if (psql--blank? sql)
         (message "psql: buffer is empty")
-        (psql--with-url (lambda ()
-                          (when (equal? (current-buffer) "*psql-query*")
-                            (psql--history-add! sql))
-                          (psql--read-vars (psql--unset-vars sql) '()
-                                           (lambda (vars) (psql--run-sql sql vars))))))))
+        (psql--run-flow sql sql (lambda (vars) (psql--run-sql sql vars))))))
+
+;; C-c C-c: the active region, else the statement at point.
+(define-command (psql-run-statement)
+  (let ((target (psql--target-sql)))
+    (if (not target)
+        (message "psql: no statement at point")
+        (let ((sql (string-append (car target) (cadr target))))
+          (psql--run-flow sql (cadr target) (lambda (vars) (psql--run-sql sql vars)))))))
+
+;; ── the statement at point ────────────────────────────────────────────────────
+;; The buffer is split into statements the way psql reads it: at `;` outside
+;; comments, quoted strings / identifiers and dollar quotes, and after a
+;; backslash meta-command's line (`\gx`, `\gset`, `\set …` each end one). Ranges
+;; are BYTE offsets, matching point and buffer-substring.
+(define (psql--char-bytes c)
+  (let ((cp (char->integer c)))
+    (cond ((< cp 128) 1) ((< cp 2048) 2) ((< cp 65536) 3) (else 4))))
+(define (psql--prefix? needle cs)
+  (cond ((null? needle) #t)
+        ((null? cs) #f)
+        ((char=? (car needle) (car cs)) (psql--prefix? (cdr needle) (cdr cs)))
+        (else #f)))
+;; Consume `cs` through the first `needle` (or to the end) → (rest . bytes).
+(define (psql--consume cs needle)
+  (let loop ((cs cs) (b 0))
+    (cond ((null? cs) (cons '() b))
+          ((psql--prefix? needle cs)
+           (cons (list-tail cs (length needle))
+                 (+ b (psql--sum (map psql--char-bytes needle)))))
+          (else (loop (cdr cs) (+ b (psql--char-bytes (car cs))))))))
+
+;; → ((start end) …), every byte of `sql` in exactly one range.
+(define (psql--statement-ranges sql)
+  (let loop ((cs (string->list sql)) (pos 0) (start 0) (acc '()))
+    (define (cut end rest) (loop rest end end (cons (list start end) acc)))
+    ;; skip an `open`-byte opener, then through `needle`
+    (define (skip rest open needle)
+      (let ((r (psql--consume rest needle)))
+        (loop (car r) (+ pos open (cdr r)) start acc)))
+    (if (null? cs)
+        (reverse (if (> pos start) (cons (list start pos) acc) acc))
+        (let* ((c (car cs))
+               (rest (cdr cs))
+               (nx (if (pair? rest) (car rest) #\space)))
+          (cond
+           ((and (char=? c #\-) (char=? nx #\-)) (skip (cdr rest) 2 (list #\newline)))
+           ((and (char=? c #\/) (char=? nx #\*)) (skip (cdr rest) 2 (list #\* #\/)))
+           ((char=? c #\') (skip rest 1 (list #\')))
+           ((char=? c #\") (skip rest 1 (list #\")))
+           ((char=? c #\$)                    ; $tag$ … $tag$ (not a $1 param)
+            (let* ((t (psql--take-name rest))
+                   (tag (car t))
+                   (after (cdr t)))
+              (if (and (pair? after) (char=? (car after) #\$)
+                       (or (equal? tag "") (psql--var-start? (car rest))))
+                  (let ((delim (append (list #\$) (string->list tag) (list #\$))))
+                    (skip (cdr after) (psql--sum (map psql--char-bytes delim)) delim))
+                  (loop rest (+ pos 1) start acc))))
+           ((char=? c #\;) (cut (+ pos 1) rest))
+           ((char=? c #\\)
+            (let ((r (psql--consume rest (list #\newline))))
+              (cut (+ pos 1 (cdr r)) (car r))))
+           (else (loop rest (+ pos (psql--char-bytes c)) start acc)))))))
+
+(define (psql--range-text r) (buffer-substring (car r) (cadr r)))
+(define (psql--range-blank? r) (psql--blank? (trim (psql--range-text r))))
+
+;; The range holding point `p`. Point just past a `;` on the same line (insert
+;; state, right after typing it) means the statement it ends; in a blank stretch
+;; after the last statement, the last one.
+(define (psql--statement-at ranges p)
+  (let* ((n (length ranges))
+         (i (let loop ((i 0) (rs ranges))
+              (cond ((null? rs) (- n 1))
+                    ((< p (cadr (car rs))) i)
+                    (else (loop (+ i 1) (cdr rs))))))
+         (before (if (< i 0) "" (buffer-substring (car (nth ranges i)) p)))
+         (i (if (and (> i 0) (psql--blank? before) (not (string-contains? before "\n")))
+                (- i 1)
+                i)))
+    (cond ((< i 0) #f)
+          ((not (psql--range-blank? (nth ranges i))) (nth ranges i))
+          (else                               ; nearest non-blank before, else after
+           (let back ((j (- i 1)))
+             (cond ((>= j 0) (if (psql--range-blank? (nth ranges j)) (back (- j 1)) (nth ranges j)))
+                   (else (let fwd ((j (+ i 1)))
+                           (cond ((>= j n) #f)
+                                 ((psql--range-blank? (nth ranges j)) (fwd (+ j 1)))
+                                 (else (nth ranges j)))))))))))
+
+;; Helix keeps a one-character selection under the cursor; that isn't a region
+;; anyone means to run.
+(define (psql--region-sql)
+  (if (region-active?)
+      (let ((t (region-text)))
+        (if (> (string-length (trim t)) 1) t #f))
+      #f))
+
+;; What C-c C-c / C-c C-e act on → (prelude statement), or #f. The region as
+;; selected; otherwise the statement at point, with the buffer's other `\set`
+;; lines as a prelude so variables defined elsewhere in the buffer still apply.
+(define (psql--target-sql)
+  (let ((region (psql--region-sql)))
+    (if region
+        (list "" region)
+        (let* ((ranges (psql--statement-ranges (buffer-string)))
+               (r (psql--statement-at ranges (point))))
+          (if (not r)
+              #f
+              (list (apply string-append
+                           (map (lambda (o) (string-append (trim (psql--range-text o)) "\n"))
+                                (filter (lambda (o)
+                                          (and (not (equal? o r))
+                                               (starts-with? (trim (psql--range-text o)) "\\set ")))
+                                        ranges)))
+                    (trim (psql--range-text r))))))))
 
 ;; ── query variables ───────────────────────────────────────────────────────────
 ;; psql interpolates `:name`, `:'name'` (as a literal) and `:"name"` (as an
@@ -1484,9 +1769,12 @@
                 (string-append " -v " (psql--sh-quote (string-append (car kv) "=" (cdr kv)))))
               vars)))
 
-;; Run `sql` asynchronously; results land in a grid (psql--run-exit). The
-;; optional `vars` are ((name . value) …) passed to psql as -v.
-(define (psql--run-sql sql . rest)
+;; Run the script `text` asynchronously on the "psql" lane with psql `flags`,
+;; collecting output lines through psql--run-output (and its row cap), then
+;; calling `on-exit` with psql's exit code. `vars` are ((name . value) …)
+;; passed as -v. psql's own exit code is smuggled out through a status file —
+;; the pipeline's code is head's, which is always 0.
+(define (psql--spawn-script text flags vars on-exit)
   (cond
    ((async-lane-live? "psql")
     (message "psql: a query is already running — C-g cancels it"))
@@ -1494,28 +1782,33 @@
     (let ((file (psql--query-file))
           (status (psql--status-file))
           (u (psql--url)))
-      (write-file file (string-append "\\timing on\n" sql "\n"))
+      (write-file file text)
       (psql--st! 'async-out '())
       (psql--st! 'async-n 0)
       (psql--st! 'capped #f)
-      ;; -A = unaligned output (headers + footers kept) — the display table is
-      ;; built by psql--format-results, with per-cell clamping. FETCH_COUNT
-      ;; streams results in batches so the caps can cut a runaway result off
-      ;; early. psql's own exit code is smuggled out through a status file —
-      ;; the pipeline's code is head's, which is always 0.
       (async-lane-run "psql" "/bin/sh"
         (list "-c" (string-append
                     "{ " (psql--sh-quote (psql--command)) " "
                     (if (equal? u "") "" (string-append "-d " (psql--sh-quote u) " "))
-                    "-v FETCH_COUNT=100" (psql--var-args (if (null? rest) '() (car rest)))
-                    " -X -q -A"
-                    " -P recordsep=" psql--RS " -P fieldsep=" psql--FS
-                    " -P pager=off -f " (psql--sh-quote file)
+                    flags (psql--var-args vars)
+                    " -X -q -P pager=off -f " (psql--sh-quote file)
                     " 2>&1; echo $? > " (psql--sh-quote status)
                     "; } | head -c " (number->string (psql--max-output))
                     "; exit \"$(cat " (psql--sh-quote status) ")\""))
-        'psql--run-output 'psql--run-exit)
+        'psql--run-output on-exit)
       (message "psql: running… (C-g in the query buffer cancels)")))))
+
+;; Run `sql` asynchronously; results land in a grid (psql--run-exit). The
+;; optional `vars` are ((name . value) …) passed to psql as -v.
+;; -A = unaligned output (headers + footers kept) — the display table is built
+;; by psql--format-results, with per-cell clamping. FETCH_COUNT streams results
+;; in batches so the caps can cut a runaway result off early.
+(define (psql--run-sql sql . rest)
+  (psql--spawn-script (string-append "\\timing on\n" sql "\n")
+                      (string-append "-v FETCH_COUNT=100 -A"
+                                     " -P recordsep=" psql--RS " -P fieldsep=" psql--FS)
+                      (if (null? rest) '() (car rest))
+                      'psql--run-exit))
 
 ;; Accumulate as a reversed LIST and join once on exit — appending each line to
 ;; one growing string is quadratic and crawls on megabyte outputs. Past the row
@@ -1766,6 +2059,228 @@
 (remove-hook "grid-load-hook" "psql--grid-load")
 (add-hook "grid-load-hook" "psql--grid-load")
 
+;; ── EXPLAIN ───────────────────────────────────────────────────────────────────
+;; C-c C-e explains the region / statement at point; C-c C-a runs EXPLAIN
+;; (ANALYZE, BUFFERS) on it — inside BEGIN … ROLLBACK, so explaining an
+;; INSERT / UPDATE / DELETE doesn't keep its changes. The plan opens as
+;; *psql-explain*: one foldable section per plan node, nested like the plan.
+;; With ANALYZE each node gets its SELF time (its own time × loops, minus its
+;; children's) and that time's share of the whole run, as a bar — the slow node
+;; stands out without reading every line — and a node whose actual rows are
+;; ≥ 10× off the planner's estimate is flagged (stale statistics, or a
+;; correlation the planner can't see). Below a Limit, nodes stop early, so
+;; there only under-estimates (more rows than planned) count.
+(define (psql--explain analyze)
+  (let ((target (psql--target-sql)))
+    (if (not target)
+        (message "psql: no statement at point")
+        (let* ((stmt (let ((t (trim (cadr target))))
+                       (if (ends-with? t ";") (trim-end (substring t 0 (- (string-length t) 1))) t)))
+               (body (if analyze
+                         (string-append "\\set ON_ERROR_STOP on\nbegin;\n"
+                                        "explain (analyze, buffers) " stmt ";\nrollback;\n")
+                         (string-append "explain " stmt ";\n")))
+               (sql (string-append (car target) body)))
+          (psql--run-flow sql (cadr target)
+                          (lambda (vars)
+                            (psql--st! 'plan-req (list analyze stmt))
+                            (psql--spawn-script sql "-A -t" vars 'psql--explain-exit)))))))
+(define-command (psql-explain) (psql--explain #f))
+(define-command (psql-explain-analyze) (psql--explain #t))
+
+(define (psql--explain-exit code)
+  (let ((user-cancelled (and (async-lane-finish "psql") (not (psql--st 'capped))))
+        (lines (reverse (psql--st 'async-out))))
+    (cond
+     (user-cancelled (message "psql: explain cancelled"))
+     ((psql--not-found? code) (message (psql--not-found-msg)))
+     (else
+      (let ((plan (filter (lambda (l) (not (or (psql--blank? l) (psql--chatter? l)))) lines)))
+        (when (equal? (current-buffer) "*psql-query*") (other-window))
+        (if (or (not (equal? code "0")) (null? plan))
+            (psql--error (if (equal? code "0") "1" code) (string-join lines "\n"))
+            (let ((req (psql--st 'plan-req)))
+              (psql--st! 'plan-run (+ 1 (psql--st 'plan-run)))
+              (psql--st! 'plan (list (car req) (cadr req) plan (psql--st 'plan-run)))
+              (psql--explain-draw! (psql--st 'plan))
+              (psql--normal-state)
+              (let ((exec (filter (lambda (l) (starts-with? l "Execution Time:")) plan)))
+                (message (if (null? exec)
+                             "psql: plan ready — TAB folds a node"
+                             (string-append "psql: plan ready — " (car exec))))))))))))
+;; psql / server messages mixed into the plan stream (2>&1).
+(define (psql--chatter? l)
+  (or (starts-with? l "psql:") (starts-with? l "ERROR") (starts-with? l "FATAL")
+      (starts-with? l "NOTICE") (starts-with? l "WARNING") (starts-with? l "DETAIL:")
+      (starts-with? l "HINT:") (starts-with? l "LINE ") (starts-with? (trim-start l) "^")))
+
+;; ── plan parsing ──
+(define (psql--indent l) (- (string-length l) (string-length (trim-start l))))
+;; The token right after `key` (up to a space or `)`), or #f.
+(define (psql--token-after s key)
+  (let ((parts (split-many s key)))
+    (if (null? (cdr parts))
+        #f
+        (let loop ((cs (string->list (cadr parts))) (acc '()))
+          (if (or (null? cs) (char=? (car cs) #\space) (char=? (car cs) #\)))
+              (list->string (reverse acc))
+              (loop (cdr cs) (cons (car cs) acc)))))))
+;; "12.345" (ms) → 12345 (µs), integer math.
+(define (psql--ms->us s)
+  (let* ((parts (split-many s "."))
+         (whole (psql--num (car parts)))
+         (frac (if (null? (cdr parts)) "" (cadr parts))))
+    (if (< whole 0)
+        0
+        (+ (* whole 1000) (max 0 (psql--num (substring (string-append frac "000") 0 3)))))))
+(define (psql--us-h us)
+  (cond ((< us 1000) (string-append (number->string us) "µs"))
+        ((< us 1000000) (psql--tenths us 1000 "ms"))
+        (else (psql--tenths us 1000000 "s"))))
+
+;; One node line → (total-µs est-rows actual-rows ran?). The estimate is in the
+;; cost parens; the actuals (per loop) in "(actual …)"; total = time × loops.
+(define (psql--node-stats text)
+  (let* ((halves (split-many text "(actual "))
+         (est (psql--num (let ((t (psql--token-after (car halves) "rows="))) (if t t "-1")))))
+    (if (null? (cdr halves))
+        (list 0 est -1 #f)
+        (let* ((act (cadr halves))
+               (tm (psql--token-after act "time="))
+               (end (if tm (let ((p (split-many tm ".."))) (if (null? (cdr p)) "0" (cadr p))) "0"))
+               (loops (max 1 (psql--num (let ((t (psql--token-after act "loops="))) (if t t "1")))))
+               (rows (psql--num (let ((t (psql--token-after act "rows="))) (if t t "-1")))))
+          (list (* (psql--ms->us end) loops) est rows #t)))))
+
+;; Plan lines → (entries summary nodes):
+;;   entries — ("node" pops idx line) / ("detail" pops line), in plan order;
+;;             `pops` = how many open node sections end before this line
+;;   summary — the trailing Planning / Execution / JIT lines
+;;   nodes   — (parent total est rows ran? name) per node idx (root = 0)
+;; Nesting follows psql's indentation: a node's details sit 2 columns past its
+;; text (6 past a child's `->`), and its children's arrows at that same column.
+(define (psql--parse-plan lines)
+  (let loop ((ls lines) (stack '()) (entries '()) (summary '()) (nodes '()) (in-summary #f))
+    (define (pops col)                        ; open sections whose depth > col
+      (let count ((st stack) (n 0))
+        (if (and (pair? st) (> (car (car st)) col)) (count (cdr st) (+ n 1)) n)))
+    (if (null? ls)
+        (list (reverse entries) (reverse summary) (reverse nodes))
+        (let* ((l (car ls))
+               (col (psql--indent l))
+               (text (trim-start l))
+               (arrow (starts-with? text "->")))
+          (cond
+           ((or in-summary (and (pair? nodes) (null? stack) (not arrow)))
+            (loop (cdr ls) stack entries (cons l summary) nodes #t))
+           ((or arrow (null? nodes))
+            (let* ((n (pops col))
+                   (st (list-tail stack n))
+                   (idx (length nodes))
+                   (parent (if (null? st) -1 (cdr (car st))))
+                   (depth (+ col (if arrow 6 2))))
+              (loop (cdr ls) (cons (cons depth idx) st)
+                    (cons (list "node" n idx l) entries) summary
+                    (cons (cons parent (append (psql--node-stats text) (list (psql--node-name text))))
+                          nodes)
+                    #f)))
+           (else
+            (let ((n (pops col)))
+              (if (= n (length stack))            ; shallower than every node
+                  (loop (cdr ls) '() entries (cons l summary) nodes #t)
+                  (loop (cdr ls) (list-tail stack n)
+                        (cons (list "detail" n l) entries) summary nodes #f)))))))))
+
+;; Self time per node: its total minus its direct children's, never negative.
+;; Is any ancestor of node `idx` a Limit?
+(define (psql--under-limit? nodes idx)
+  (let ((parent (car (nth nodes idx))))
+    (and (>= parent 0)
+         (or (starts-with? (nth (nth nodes parent) 5) "Limit")
+             (psql--under-limit? nodes parent)))))
+(define (psql--self-times nodes)
+  (let ((totals (map cadr nodes)))
+    (let loop ((i 0) (ns nodes) (acc '()))
+      (if (null? ns)
+          (reverse acc)
+          (loop (+ i 1) (cdr ns)
+                (cons (max 0 (- (nth (car ns) 1)
+                                (psql--sum (map cadr (filter (lambda (m) (= (car m) i)) nodes)))))
+                      acc))))))
+
+;; ── plan rendering ──
+(define psql--plan-gutter 30)   ; SELF + SHARE + bar, before the plan text
+(define (psql--node-name text)
+  (let ((t (trim-start text)))
+    (car (split-many (if (starts-with? t "->") (trim-start (substring t 2 (string-length t))) t)
+                     "  ("))))
+
+(define (psql--explain-draw! plan)
+  (let* ((analyze (nth plan 0))
+         (stmt (nth plan 1))
+         (parsed (psql--parse-plan (nth plan 2)))
+         (run (number->string (nth plan 3)))
+         (entries (car parsed))
+         (nodes (nth parsed 2))
+         (selfs (psql--self-times nodes))
+         (whole (if (null? nodes) 0 (max 1 (nth (car nodes) 1))))
+         (pad (if analyze (string-repeat " " psql--plan-gutter) "")))
+    (section-begin)
+    (section-line (if analyze "EXPLAIN (ANALYZE, BUFFERS) — run inside BEGIN … ROLLBACK" "EXPLAIN")
+                  "psql-header")
+    (section-line (let ((one (string-join (filter (lambda (w) (not (equal? w "")))
+                                                  (split-many (string-join (split-many stmt "\n") " ") " "))
+                                          " ")))
+                    (if (> (string-length one) 160) (string-append (substring one 0 160) "…") one))
+                  "psql-dim")
+    (for-each (lambda (l) (section-line (string-append "  " l) #f)) (cadr parsed))
+    (psql--emit-hint "TAB/RET fold node · yy copy line · Y copy plan · q close")
+    (when analyze
+      (section-line (string-append (pad-left "SELF" 9) "  " (pad-left "SHARE" 6)) "psql-dim"))
+    (for-each
+     (lambda (e)
+       (let loop ((n (nth e 1))) (when (> n 0) (section-close) (loop (- n 1))))
+       (if (equal? (car e) "detail")
+           (section-line (string-append pad (nth e 2)) "psql-dim")
+           (let* ((idx (nth e 2))
+                  (line (nth e 3))
+                  (node (nth nodes idx))
+                  (self (nth selfs idx))
+                  (pm (quotient (* self 1000) whole))
+                  (est (nth node 2))
+                  (rows (nth node 3))
+                  (off (and analyze (nth node 4) (>= est 0) (>= rows 0)
+                            (if (> rows est)
+                                (>= rows (* 10 (max 1 est)))
+                                (and (>= est (* 10 (max 1 rows)))
+                                     (not (psql--under-limit? nodes idx))))))
+                  (self-cell (pad-left (if (nth node 4) (psql--us-h self) "never") 9))
+                  (pre-bar (string-append self-cell "  " (pad-left (psql--pct pm) 6) " "))
+                  (bar (psql--bar self whole 10))
+                  (gutter (if analyze (string-append pre-bar bar "  ") ""))
+                  (suffix (if off
+                              (string-append "  ▲ " (number->string rows) " rows vs "
+                                             (number->string est) " estimated")
+                              ""))
+                  (b (section-point-byte))
+                  (name (psql--node-name line))
+                  (name-at (+ (utf8-length gutter)
+                              (if (equal? name "") 0 (utf8-length (car (split-many line name)))))))
+             (section-open (string-append "psql-plan/" run "/" (number->string idx))
+                           (string-append gutter line suffix) #f)
+             (when analyze
+               (when (>= pm 200)
+                 (section-accent b (+ b (utf8-length self-cell)) (if (>= pm 500) "psql-err" "psql-warn")))
+               (section-accent (+ b (utf8-length pre-bar)) (+ b (utf8-length pre-bar) (utf8-length bar))
+                               "psql-bar"))
+             (section-accent (+ b name-at) (+ b name-at (utf8-length name)) "psql-header")
+             (unless (equal? suffix "")
+               (let ((at (+ b (utf8-length gutter) (utf8-length line))))
+                 (section-accent at (+ at (utf8-length suffix)) "psql-warn"))))))
+     entries)
+    (section-render "*psql-explain*" "psql-plan-mode")
+    (psql--st! 'built "*psql-explain*")))
+
 ;; C-g in a sql buffer: cancel a live query, else the ordinary keyboard-quit.
 (define-command (psql-query-cancel) (async-lane-quit "psql"))
 ;; C-c C-k from the query pane: kill the buffer and collapse the pane.
@@ -1984,6 +2499,22 @@
     (if rows
         (psql--catalog-build! rows)
         (psql--st! 'cat-state "failed"))))
+;; The dashboard's piggy-back refresh, in the background on its own lane (it
+;; can overlap a view fetch). A URL change while it's out discards the result.
+(define (psql--catalog-refresh-async!)
+  (unless (async-lane-live? "psql-catalog")
+    (psql--st! 'cat-url (psql--url))
+    (psql--spawn "psql-catalog"
+                 (append (psql--conn) psql--tuples-flags (list "-c" psql--catalog-sql))
+                 'psql--catalog-exit)))
+(define (psql--catalog-exit code)
+  (let ((cancelled (async-lane-finish "psql-catalog")))
+    (when (and (not cancelled) (equal? (psql--st 'cat-url) (psql--url)))
+      (if (equal? code "0")
+          (psql--catalog-build!
+           (map (lambda (ln) (psql--fields-n ln 3))
+                (psql--lines (car (psql--fetched "psql-catalog")))))
+          (psql--st! 'cat-state "failed")))))
 (define (psql--catalog-ensure!)
   ;; a still-locked URL would hit the PG* defaults and cache "failed"
   (when (and (equal? (psql--st 'cat-state) "") (not (psql--url-pending?)))
@@ -2127,6 +2658,10 @@
 (define-key "psql-mode" "n" 'next-line)
 (define-key "psql-mode" "p" 'previous-line)
 (define-key "psql-mode" "q" 'psql-quit)
+;; Cancel an in-flight refresh (plain C-g only reaches here under Emacs
+;; bindings — evil resolves it first — so the C-c C-g chord too).
+(define-key "psql-mode" "ctrl-g" 'psql-cancel)
+(define-key "psql-mode" "ctrl-c ctrl-g" 'psql-cancel)
 
 ;; Results / error buffers: read-only scroll + copy.
 (set-option "line-numbers:psql-result-mode" "false")
@@ -2136,11 +2671,24 @@
 (define-key "psql-result-mode" "p" 'previous-line)
 (define-key "psql-result-mode" "q" 'kill-buffer)
 
-;; sql-mode: run / cancel / close. These land in the "sql" major-mode keymap, so
-;; C-c C-c runs the buffer's SQL from any .sql file too (against `psql-url`) —
-;; the Emacs sql-mode habit. C-g falls through to keyboard-quit when no query is
-;; running, so it stays safe as a global-quit key in sql buffers.
-(define-key "sql" "ctrl-c ctrl-c" 'psql-run-buffer)
+;; The EXPLAIN plan: fold nodes, copy, close.
+(set-option "line-numbers:psql-plan-mode" "false")
+(define-key "psql-plan-mode" "tab" 'psql-toggle-fold)
+(define-key "psql-plan-mode" "enter" 'psql-toggle-fold)
+(define-key "psql-plan-mode" "y y" 'psql-copy-line)
+(define-key "psql-plan-mode" "shift-y" 'psql-copy-buffer)
+(define-key "psql-plan-mode" "n" 'next-line)
+(define-key "psql-plan-mode" "p" 'previous-line)
+(define-key "psql-plan-mode" "q" 'kill-buffer)
+
+;; sql-mode: run / explain / cancel / close. These land in the "sql" major-mode
+;; keymap, so they work from any .sql file too (against `psql-url`) — the Emacs
+;; sql-mode habit. C-g falls through to keyboard-quit when no query is running,
+;; so it stays safe as a global-quit key in sql buffers.
+(define-key "sql" "ctrl-c ctrl-c" 'psql-run-statement)
+(define-key "sql" "ctrl-c ctrl-b" 'psql-run-buffer)
+(define-key "sql" "ctrl-c ctrl-e" 'psql-explain)
+(define-key "sql" "ctrl-c ctrl-a" 'psql-explain-analyze)
 (define-key "sql" "ctrl-c ctrl-k" 'psql-query-close)
 ;; Plain C-g is resolved by the evil layer before major-mode keymaps, so the
 ;; C-c C-g chord is the binding that works everywhere; C-g still cancels under
@@ -2188,3 +2736,5 @@
   (define-key km "ctrl-u" 'evil-scroll-up))
 (psql--bind-readonly-motion "evil-normal:psql-result-mode")
 (psql--bind-readonly-motion "helix-normal:psql-result-mode")
+(psql--bind-readonly-motion "evil-normal:psql-plan-mode")
+(psql--bind-readonly-motion "helix-normal:psql-plan-mode")
