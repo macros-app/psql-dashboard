@@ -8,13 +8,16 @@ and cache health, a list of things worth a look (bloat, dead rows, unused
 indexes, blocked or long-running sessions), live activity, and every schema's
 relations with size bars. `RET` drills into a schema, then into a table
 (sizes, stats, columns with planner statistics, indexes, constraints,
-foreign keys in both directions), and `q` goes back. `s` opens a half-window
-**sql-mode** query pane — write SQL with real tree-sitter highlighting, `C-c
-C-c` runs it asynchronously, and the results open as a grid.
+foreign keys in both directions), and `q` goes back. Every view loads in the
+background, so a slow or remote server never freezes the editor. `s` opens a
+half-window **sql-mode** query pane — write SQL with real tree-sitter
+highlighting, `C-c C-c` runs the statement at point asynchronously, the
+results open as a grid, and `C-c C-e` / `C-c C-a` show its plan as a foldable
+tree with the slow node marked.
 
 The Rust core knows nothing about Postgres — the package sits entirely on the
-same editor primitives magit and macros-k8s use: `call-process-full` (catalog
-queries), `lib-async` (cancellable async user queries), `lib-section` (foldable
+same editor primitives magit and macros-k8s use: `lib-async` (cancellable
+background catalog fetches and user queries), `lib-section` (foldable
 sections), `render-buffer`, `split-window-below` + `set-major-mode` (the query
 pane), and `lib-transient` (the `?` popup).
 
@@ -151,7 +154,17 @@ public  (143 relations · 989.6 MB · kyle)
   bar; the `… N more` line opens the full list. `~ROWS` is the planner's
   estimate (`reltuples`, `?` until the first `ANALYZE`).
 
-All of a view's catalog queries run over one psql connection.
+All of a view's catalog queries run over one psql connection, **in the
+background**: `RET`, `r`, `^` and auto-refresh return immediately, and the view
+draws when the data arrives. The first `M-x psql-dashboard` shows a
+"Connecting to …" line until then; drilling in leaves you where you are, with
+"opening …" in the echo area. `C-g` (or `C-c C-g` under evil) cancels a fetch
+in flight. One fetch runs at a time — asking for another while one is out
+queues it, newest request wins, so mashing `r` costs one extra round trip. If
+you've moved to another buffer by the time a drill-down arrives, its buffer is
+filled in without taking focus. Connecting gives up after
+`PGCONNECT_TIMEOUT` seconds (10 unless you set it), so an unreachable host
+can't hang the dashboard.
 
 ## Drill-down
 
@@ -182,7 +195,8 @@ In the dashboard / schema / table buffers (`psql-mode`):
 
 | Key           | Action                                                     |
 | ------------- | ---------------------------------------------------------- |
-| `r`           | refresh the current buffer                                 |
+| `r`           | refresh the current buffer (in the background)             |
+| `C-g` / `C-c C-g` | cancel a refresh in flight                             |
 | `a`           | toggle dashboard auto-refresh                              |
 | `v`           | preview the table at point as a grid                       |
 | `RET` / `g`   | drill into the schema / table at point                     |
@@ -207,24 +221,44 @@ all your usual keymaps. Then:
 
 | Key         | Action                                                        |
 | ----------- | ------------------------------------------------------------- |
-| `C-c C-c`   | run the buffer's SQL (asynchronously — the editor never blocks) |
+| `C-c C-c`   | run the **region**, or else the **statement at point** (asynchronously — the editor never blocks) |
+| `C-c C-b`   | run the whole buffer                                          |
+| `C-c C-e`   | `EXPLAIN` the region / statement at point (see below)         |
+| `C-c C-a`   | `EXPLAIN (ANALYZE, BUFFERS)` it, inside `BEGIN … ROLLBACK`    |
 | `C-c C-g`   | cancel the running query (plain `C-g` also works under Emacs bindings — evil intercepts it) |
 | `C-c C-k`   | close the query pane                                          |
 
 Results open in the other window, so the query stays visible, as a **grid**
 (a CSV in macros' grid mode: sort, filter, resize columns, copy, formulas).
 The header row is frozen, cells hold full values, and the echo area shows the
-row count and `\timing`. The buffer may hold several statements; they run in
-order in one session, and the **last** result set is shown, with earlier ones
-written next to it as `psql-result-N.csv`.
+row count and `\timing`. With `C-c C-b` the buffer may hold several
+statements; they run in order in one session, and the **last** result set is
+shown, with earlier ones written next to it as `psql-result-N.csv`.
+
+### The statement at point
+
+`C-c C-c` splits the buffer into statements the way psql reads it — at `;`,
+ignoring semicolons inside comments, quoted strings and identifiers, and
+dollar quotes; a backslash meta-command (`\gx`, `\set …`) ends its line's
+statement — and runs the one under the cursor:
+
+- point just past a statement's `;` (where it sits right after you type it)
+  runs that statement; on a blank line between two, the one below;
+- past the last statement (a trailing blank line), the last one;
+- an active region (Emacs mark, evil visual, a helix selection wider than one
+  character) runs exactly the selected text instead.
+
+The buffer's other `\set` lines are sent along as a prelude, so
+`\set n 5` at the top still applies to `select … :n` further down — no
+prompt. Only the statement that ran goes into history.
 
 If a statement errors, or nothing returns rows (DDL, `SET`, …), the output
 opens as the org results described below instead, so messages are readable.
 Set `psql-results-view` to `"org"` to always get org tables.
 
-These bindings live in the `sql` major-mode keymap, so `C-c C-c` also runs the
-contents of **any `.sql` file buffer** against the configured URL — the Emacs
-`sql-mode` habit.
+These bindings live in the `sql` major-mode keymap, so `C-c C-c`, `C-c C-b`
+and the EXPLAIN keys also work in **any `.sql` file buffer**, against the
+configured URL — the Emacs `sql-mode` habit.
 
 ### Variables
 
@@ -322,6 +356,44 @@ early. There is **no LIMIT injected**; a huge result set is simply truncated
 at the row cap. Cancel a long-running query with `C-g`.
 
 
+## EXPLAIN
+
+`C-c C-e` explains the region / statement at point; `C-c C-a` runs `EXPLAIN
+(ANALYZE, BUFFERS)` on it — wrapped in `BEGIN … ROLLBACK`, so explaining an
+`INSERT` / `UPDATE` / `DELETE` doesn't keep its changes (statements that can't
+run in a transaction, like `CREATE INDEX CONCURRENTLY`, can't be explained this
+way). The plan opens in `*psql-explain*` (in the other window from the query
+pane):
+
+```
+EXPLAIN (ANALYZE, BUFFERS) — run inside BEGIN … ROLLBACK
+select count(*) from c where x = 1 and y = 1
+  Planning Time: 0.271 ms
+  Execution Time: 2.878 ms
+
+     SELF   SHARE
+     33µs    1.1% ▏           Aggregate  (cost=2076.03..2076.04 rows=1 width=8) (actual time=2.824..2.825 rows=1 loops=1)
+                                Buffers: shared hit=576
+    2.7ms   98.8% █████████▉    ->  Seq Scan on c  (cost=0.00..2076.00 rows=11 width=0) (actual time=0.023..2.792 rows=1000 loops=1)  ▲ 1000 rows vs 11 estimated
+                                      Filter: ((x = 1) AND (y = 1))
+                                      Rows Removed by Filter: 99000
+```
+
+- Every plan node is a **foldable section** nested like the plan (`TAB` / `RET`),
+  its details (filters, buffers, sort method, …) inside it.
+- With ANALYZE, **SELF** is the node's own time — actual time × loops, minus
+  its children's — and **SHARE** that time's part of the whole run, with a
+  bar; a node over 20% is highlighted, over 50% in red. (Parallel workers make
+  per-loop times approximate.)
+- A node whose actual rows are **≥ 10× off the estimate** is flagged `▲` —
+  stale statistics, or columns the planner doesn't know are correlated. Under
+  a `Limit`, nodes stop early, so there only under-estimates are flagged.
+- Planning / execution time and JIT lines sit at the top; the echo area shows
+  the execution time.
+
+`yy` copies a line, `Y` the plan, `q` closes. psql variables are prompted for
+as with `C-c C-c`.
+
 ## Org-mode source blocks
 
 `psql` (and `sql`) are registered as org-babel languages, so `C-c C-c` /
@@ -354,9 +426,12 @@ query, set URL, up).
   default expression can't shift columns. A `|` inside a *schema or table
   name* would still confuse the dashboard — don't do that.
 - Row counts are planner estimates (`pg_class.reltuples`), not `count(*)`.
-- Dashboard/drill-down catalog queries are synchronous (one psql run per
-  view); only the query pane runs async. Auto-refresh therefore only redraws
-  while the dashboard is the buffer in front.
+- Auto-refresh only fetches while the dashboard is the buffer in front (and
+  drops a redraw that lands after you've left), so it never redraws a buffer
+  you aren't looking at.
+- SQL completion's very first catalog fetch (when nothing has rendered a
+  dashboard yet) is synchronous; every later refresh happens in the
+  background alongside the dashboard's.
 - System schemas (`pg_*`, `information_schema`) are hidden.
 
 ## License
